@@ -55,6 +55,7 @@ dp = Dispatcher()
 
 engine = create_engine(DB_URL)
 SessionLocal = create_sessionmaker(engine)
+dp.update.middleware(BanGuardMiddleware(SessionLocal))
 
 BANNED_TEXT = "Sei stato bannato, per essere sbannato scrivi a @gioorgioo"
 
@@ -89,8 +90,6 @@ class BlockMiddleware(BaseMiddleware):
 
 
 # Подключаем middleware на любые сообщения и callback-и
-dp.message.middleware(BlockMiddleware())
-dp.callback_query.middleware(BlockMiddleware())
 
 
 # ---------- Helpers ----------
@@ -196,6 +195,55 @@ async def send_candidate(message: Message, target_user, note: str | None = None)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+class BanGuardMiddleware(BaseMiddleware):
+    """Блокирует забаненных пользователей на любом апдейте."""
+
+    def __init__(self, sessionmaker):
+        super().__init__()
+        self._SessionLocal = sessionmaker
+        self._cache = {}  # tg_id -> (is_blocked, expires_ts)
+
+    async def __call__(self, handler, event, data):
+        from aiogram.types import Message, CallbackQuery
+        user = data.get("event_from_user")
+        if user is None:
+            user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+
+        tg_id = int(user.id)
+
+        # Админ всегда может /unban
+        if isinstance(event, Message) and event.text and event.text.strip().lower().startswith("/unban") and is_admin(tg_id):
+            return await handler(event, data)
+
+        now = asyncio.get_event_loop().time()
+        cached = self._cache.get(tg_id)
+        if cached and cached[1] > now:
+            if cached[0]:
+                if isinstance(event, Message):
+                    await event.answer(BANNED_TEXT)
+                elif isinstance(event, CallbackQuery):
+                    await event.answer(BANNED_TEXT, show_alert=True)
+                return
+            return await handler(event, data)
+
+        async with self._SessionLocal() as session:
+            u = await get_user_by_tg_id(session, tg_id)
+            is_blocked = bool(u.blocked) if u else False
+
+        # кеш на 30 секунд
+        self._cache[tg_id] = (is_blocked, now + 30.0)
+
+        if is_blocked:
+            if isinstance(event, Message):
+                await event.answer(BANNED_TEXT)
+            elif isinstance(event, CallbackQuery):
+                await event.answer(BANNED_TEXT, show_alert=True)
+            return
+
+        return await handler(event, data)
 
 async def check_required_subscriptions(user_id: int) -> tuple[bool, list[tuple[str, str | None]]]:
     """
@@ -660,7 +708,12 @@ async def rate_rating_input(message: Message, state: FSMContext):
                 await message.answer("🚫 Il tuo account è stato bloccato.")
                 return
 
-            await save_rating(session, viewer.tg_id, target, score, pending_message)
+            saved = await save_rating(session, viewer.tg_id, target, score, pending_message)
+            if saved is None:
+                await state.clear()
+                unread = await get_unseen_count(session, viewer)
+                await message.answer("⚠️ Hai già valutato questo profilo e la tua valutazione non è ancora stata vista. Riprova più tardi.", reply_markup=main_menu_kb(unread))
+                return
 
             next_one = await get_next_candidate(session, viewer)
             unread = await get_unseen_count(session, viewer)

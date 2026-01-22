@@ -7,6 +7,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, aliased
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 
 class Base(DeclarativeBase):
@@ -85,7 +86,7 @@ class Report(Base):
 
 
 def create_engine(db_url: str):
-    return create_async_engine(db_url, echo=True)
+    return create_async_engine(db_url, echo=False)
 
 
 def create_sessionmaker(engine):
@@ -112,6 +113,16 @@ async def init_db(engine):
             # Старый UNIQUE-констрейнт мешает повторной оценке.
             # Если он уже был создан раньше — удалим.
             await conn.execute(text("ALTER TABLE ratings DROP CONSTRAINT IF EXISTS uq_rater_rated_version"))
+            await conn.execute(text("ALTER TABLE ratings DROP CONSTRAINT IF EXISTS uq_rater_rated"))
+            await conn.execute(text("DROP INDEX IF EXISTS uq_rater_rated"))
+            await conn.execute(text("DROP INDEX IF EXISTS uq_rater_rated_version"))
+            # Уникальность только на НЕПРОСМОТРЕННЫЕ оценки (чтобы можно было оценить снова после seen=True)
+            await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_rater_rated_unseen ON ratings (rater_tg_id, rated_tg_id) WHERE seen IS false"))
+            # Индексы для скорости на больших объёмах
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_last_active_at ON users(last_active_at DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ratings_rated_seen ON ratings(rated_tg_id, rated_photo_version, seen)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ratings_rater_seen ON ratings(rater_tg_id, seen)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_reports_status_created ON reports(status, created_at DESC)"))
 
 
 # ---------- Users ----------
@@ -203,7 +214,12 @@ async def save_rating(session: AsyncSession, rater_tg_id: int, rated_user: User,
         .where(User.tg_id == rater_tg_id)
         .values(last_active_at=datetime.utcnow())
     )
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Обычно означает: уже есть НЕПРОСМОТРЕННАЯ оценка viewer->candidate (uq_rater_rated_unseen)
+        await session.rollback()
+        return None
     return r
 
 
@@ -260,61 +276,73 @@ async def get_next_candidate(session: AsyncSession, viewer: User):
 
     Приоритеты:
     1) Сначала показываем тех, кто был активен последние 15 минут (ставил оценку).
-    2) Если таких нет — случайно как раньше.
+    2) Если таких нет — выдача по всему пулу.
 
     Анти-дубль (НОВАЯ ЛОГИКА):
-    - Не показываем кандидата снова, если viewer уже оценил его текущую фотку
-      и этот голос ещё НЕ просмотрен кандидатом (seen=False).
-    - Как только кандидат посмотрел в "Chi mi ha valutato" (seen=True) —
-      viewer может снова получить этого кандидата в Valuta.
-    """
+    - Не показываем кандидата снова, если viewer уже оценил его и этот голос ещё НЕ просмотрен кандидатом (seen=False).
+    - Как только кандидат посмотрел в "Chi mi ha valutato" (seen=True) — viewer может снова получить этого кандидата.
 
+    Оптимизация для больших объёмов:
+    - избегаем ORDER BY random() (дорого на миллионах строк)
+    - используем "random id pivot": ищем ближайшую анкету с id >= pivot, если нет — с id < pivot.
+    """
     gender_filter = None if viewer.rate_pref == "both" else viewer.rate_pref
     allowed_rater_gender = viewer.gender  # male/female
 
     now = datetime.utcnow()
     active_since = now - timedelta(minutes=15)
 
-    def build_query(active_only: bool):
-        q = (
-            select(User)
-            .where(
-                User.tg_id != viewer.tg_id,
-                User.blocked.is_(False),
-            )
-            .order_by(func.random())
-            .limit(1)
-        )
-
-        if active_only:
-            q = q.where(User.last_active_at.is_not(None), User.last_active_at >= active_since)
-
+    # Базовые условия
+    def base_conditions(active_only: bool):
+        conds = [
+            User.tg_id != viewer.tg_id,
+            User.blocked.is_(False),
+            (User.be_rated_by == "both") | (User.be_rated_by == allowed_rater_gender),
+        ]
         if gender_filter:
-            q = q.where(User.gender == gender_filter)
+            conds.append(User.gender == gender_filter)
+        if active_only:
+            conds.append(User.last_active_at.is_not(None))
+            conds.append(User.last_active_at >= active_since)
 
-        q = q.where((User.be_rated_by == "both") | (User.be_rated_by == allowed_rater_gender))
-
+        # Не показываем, если есть НЕПРОСМОТРЕННАЯ оценка viewer->candidate
         subq_unseen = (
             select(Rating.id)
             .where(
                 Rating.rater_tg_id == viewer.tg_id,
                 Rating.rated_tg_id == User.tg_id,
-                Rating.rated_photo_version == User.photo_version,
                 Rating.seen.is_(False),
             )
             .correlate(User)
             .exists()
         )
-        q = q.where(~subq_unseen)
-        return q
+        conds.append(~subq_unseen)
+        return conds
 
-    res = await session.execute(build_query(active_only=True))
-    cand = res.scalar_one_or_none()
+    async def pick_one(active_only: bool):
+        # Получим min/max id по текущему фильтру, чтобы выбрать pivot.
+        mm = await session.execute(select(func.min(User.id), func.max(User.id)).where(*base_conditions(active_only)))
+        min_id, max_id = mm.one()
+        if not min_id or not max_id:
+            return None
+        pivot = int(min_id + (max_id - min_id) * (os.urandom(2)[0] / 255.0))  # быстрый псевдорандом
+
+        # 1) пробуем справа
+        q1 = select(User).where(*base_conditions(active_only), User.id >= pivot).order_by(User.id).limit(1)
+        res1 = await session.execute(q1)
+        u = res1.scalar_one_or_none()
+        if u:
+            return u
+
+        # 2) пробуем слева
+        q2 = select(User).where(*base_conditions(active_only), User.id < pivot).order_by(User.id.desc()).limit(1)
+        res2 = await session.execute(q2)
+        return res2.scalar_one_or_none()
+
+    cand = await pick_one(active_only=True)
     if cand:
         return cand
-
-    res = await session.execute(build_query(active_only=False))
-    return res.scalar_one_or_none()
+    return await pick_one(active_only=False)
 
 
 # ---------- Leaderboard ----------
