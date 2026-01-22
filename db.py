@@ -1,9 +1,9 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, Integer, String, Text,
-    ForeignKey, UniqueConstraint, select, update, func, text
+    ForeignKey, select, update, func, text
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, aliased
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -35,6 +35,9 @@ class User(Base):
     blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     blocked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Обновляется, когда юзер ставит оценку (нужно для приоритета выдачи кандидатов)
+    last_active_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -53,9 +56,9 @@ class Rating(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
-    __table_args__ = (
-        UniqueConstraint("rater_tg_id", "rated_tg_id", "rated_photo_version", name="uq_rater_rated_version"),
-    )
+    # ВАЖНО: мы намеренно НЕ держим UNIQUE на (rater, rated, photo_version)
+    # потому что по новой логике повторная оценка разрешается после того,
+    # как rated реально посмотрел предыдущую оценку (seen=True).
 
 
 class RequiredChannel(Base):
@@ -101,21 +104,14 @@ async def init_db(engine):
             await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_version INTEGER DEFAULT 1"))
             await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE"))
             await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMP NULL"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP NULL"))
 
             await conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS rated_photo_version INTEGER DEFAULT 1"))
             await conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS seen BOOLEAN DEFAULT FALSE"))
 
-            await conn.execute(text("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint WHERE conname = 'uq_rater_rated_version'
-                ) THEN
-                    ALTER TABLE ratings
-                    ADD CONSTRAINT uq_rater_rated_version UNIQUE (rater_tg_id, rated_tg_id, rated_photo_version);
-                END IF;
-            END$$;
-            """))
+            # Старый UNIQUE-констрейнт мешает повторной оценке.
+            # Если он уже был создан раньше — удалим.
+            await conn.execute(text("ALTER TABLE ratings DROP CONSTRAINT IF EXISTS uq_rater_rated_version"))
 
 
 # ---------- Users ----------
@@ -181,6 +177,15 @@ async def block_user(session: AsyncSession, tg_id: int):
     await session.commit()
 
 
+async def unblock_user(session: AsyncSession, tg_id: int):
+    await session.execute(
+        update(User)
+        .where(User.tg_id == tg_id)
+        .values(blocked=False, blocked_at=None)
+    )
+    await session.commit()
+
+
 # ---------- Ratings ----------
 async def save_rating(session: AsyncSession, rater_tg_id: int, rated_user: User, score: int, message: str | None):
     r = Rating(
@@ -192,6 +197,12 @@ async def save_rating(session: AsyncSession, rater_tg_id: int, rated_user: User,
         seen=False,
     )
     session.add(r)
+    # отметим активность того, кто ставит оценку
+    await session.execute(
+        update(User)
+        .where(User.tg_id == rater_tg_id)
+        .values(last_active_at=datetime.utcnow())
+    )
     await session.commit()
     return r
 
@@ -245,47 +256,64 @@ async def get_my_rating_stats(session: AsyncSession, me: User):
 
 # ---------- Candidate подбор ----------
 async def get_next_candidate(session: AsyncSession, viewer: User):
-    if viewer.rate_pref == "both":
-        gender_filter = None
-    else:
-        gender_filter = viewer.rate_pref
+    """Подбор анкеты для Valuta.
 
-    # Кандидат должен хотеть быть оцененным полом viewer (или both)
+    Приоритеты:
+    1) Сначала показываем тех, кто был активен последние 15 минут (ставил оценку).
+    2) Если таких нет — случайно как раньше.
+
+    Анти-дубль (НОВАЯ ЛОГИКА):
+    - Не показываем кандидата снова, если viewer уже оценил его текущую фотку
+      и этот голос ещё НЕ просмотрен кандидатом (seen=False).
+    - Как только кандидат посмотрел в "Chi mi ha valutato" (seen=True) —
+      viewer может снова получить этого кандидата в Valuta.
+    """
+
+    gender_filter = None if viewer.rate_pref == "both" else viewer.rate_pref
     allowed_rater_gender = viewer.gender  # male/female
 
-    RatedAlias = Rating  # используем таблицу рейтингов для анти-дубля
+    now = datetime.utcnow()
+    active_since = now - timedelta(minutes=15)
 
-    q = (
-        select(User)
-        .where(
-            User.tg_id != viewer.tg_id,
-            User.blocked.is_(False),
+    def build_query(active_only: bool):
+        q = (
+            select(User)
+            .where(
+                User.tg_id != viewer.tg_id,
+                User.blocked.is_(False),
+            )
+            .order_by(func.random())
+            .limit(1)
         )
-        .order_by(func.random())
-        .limit(1)
-    )
 
-    # фильтр по полу кандидата (кого viewer оценивает)
-    if gender_filter:
-        q = q.where(User.gender == gender_filter)
+        if active_only:
+            q = q.where(User.last_active_at.is_not(None), User.last_active_at >= active_since)
 
-    # фильтр "кем кандидат хочет быть оценен"
-    q = q.where((User.be_rated_by == "both") | (User.be_rated_by == allowed_rater_gender))
+        if gender_filter:
+            q = q.where(User.gender == gender_filter)
 
-    # исключаем тех, кого viewer уже оценил на текущую версию фото
-    subq = (
-        select(Rating.id)
-        .where(
-            Rating.rater_tg_id == viewer.tg_id,
-            Rating.rated_tg_id == User.tg_id,
-            Rating.rated_photo_version == User.photo_version,
+        q = q.where((User.be_rated_by == "both") | (User.be_rated_by == allowed_rater_gender))
+
+        subq_unseen = (
+            select(Rating.id)
+            .where(
+                Rating.rater_tg_id == viewer.tg_id,
+                Rating.rated_tg_id == User.tg_id,
+                Rating.rated_photo_version == User.photo_version,
+                Rating.seen.is_(False),
+            )
+            .correlate(User)
+            .exists()
         )
-        .correlate(User)
-        .exists()
-    )
-    q = q.where(~subq)
+        q = q.where(~subq_unseen)
+        return q
 
-    res = await session.execute(q)
+    res = await session.execute(build_query(active_only=True))
+    cand = res.scalar_one_or_none()
+    if cand:
+        return cand
+
+    res = await session.execute(build_query(active_only=False))
     return res.scalar_one_or_none()
 
 
