@@ -108,8 +108,8 @@ def leaderboard_inline_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="1️⃣", callback_data="lb:1")
     kb.button(text="2️⃣", callback_data="lb:2")
-    # По просьбе: убрали 3 и крестик ❌, чтобы не было лишнего
-    kb.adjust(2)
+    kb.button(text="3️⃣", callback_data="lb:3")
+    kb.adjust(3)
     return kb.as_markup()
 
 

@@ -3,7 +3,7 @@ import os
 import re
 import aiohttp
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InputMediaPhoto
 from aiogram.fsm.context import FSMContext
@@ -19,7 +19,7 @@ from db import (
     get_unseen_count,
     get_top3, get_my_rank,
     list_required_channels, add_required_channel, remove_required_channel,
-    create_report, get_report, list_open_reports, close_report, block_user,
+    create_report, get_report, list_open_reports, close_report, block_user, unblock_user,
 )
 from states import Reg, EditProfile, RateFlow
 from keyboards import (
@@ -55,6 +55,42 @@ dp = Dispatcher()
 
 engine = create_engine(DB_URL)
 SessionLocal = create_sessionmaker(engine)
+
+BANNED_TEXT = "Sei stato bannato, per essere sbannato scrivi a @gioorgioo"
+
+
+class BlockMiddleware(BaseMiddleware):
+    """Если юзер заблокирован — отвечает текстом и не пускает дальше."""
+
+    async def __call__(self, handler, event, data):
+        tg_id = None
+        if hasattr(event, "from_user") and event.from_user:
+            tg_id = event.from_user.id
+
+        if not tg_id:
+            return await handler(event, data)
+
+        async with SessionLocal() as session:
+            u = await get_user_by_tg_id(session, tg_id)
+            if u and getattr(u, "blocked", False):
+                if isinstance(event, CallbackQuery):
+                    # уберём "часики"
+                    try:
+                        await event.answer()
+                    except Exception:
+                        pass
+                    if event.message:
+                        await event.message.answer(BANNED_TEXT)
+                elif isinstance(event, Message):
+                    await event.answer(BANNED_TEXT)
+                return
+
+        return await handler(event, data)
+
+
+# Подключаем middleware на любые сообщения и callback-и
+dp.message.middleware(BlockMiddleware())
+dp.callback_query.middleware(BlockMiddleware())
 
 
 # ---------- Helpers ----------
@@ -747,8 +783,8 @@ async def leaderboard(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("lb:"))
 async def leaderboard_cb(call: CallbackQuery):
     action = call.data.split(":", 1)[1]
-    # По просьбе: оставили только 1 и 2 (без 3 и без крестика)
-    if action not in ("1", "2"):
+    # Inline переключение TOP 3
+    if action not in ("1", "2", "3"):
         await call.answer()
         return
 
@@ -795,6 +831,20 @@ async def admin_panel(message: Message):
         "🚨 Segnalazioni arrivano automaticamente qui con bottoni.",
         parse_mode="Markdown"
     )
+
+
+@dp.message(Command("unban"))
+async def admin_unban(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer("Uso: `/unban 123456789`", parse_mode="Markdown")
+        return
+    tg_id = int(parts[1].strip())
+    async with SessionLocal() as session:
+        await unblock_user(session, tg_id)
+    await message.answer(f"✅ Unbannato: {tg_id}")
 
 @dp.message(Command("listchannels"))
 async def admin_list_channels(message: Message):
