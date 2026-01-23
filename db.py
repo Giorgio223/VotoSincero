@@ -9,6 +9,17 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 
+# ---------- Helpers ----------
+def _nonempty_text(col):
+    """SQL expression: column is NOT NULL and not empty/whitespace.
+
+    Some deployments may contain legacy/dirty rows (e.g., from older bot
+    versions) where required fields are NULL or empty. For matching in
+    "Valuta" we only want fully filled анкеты.
+    """
+    return col.is_not(None) & (func.length(func.trim(col)) > 0)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -39,6 +50,29 @@ class User(Base):
     last_active_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+def profile_complete_filter():
+    """SQLAlchemy boolean expression: keep only fully completed анкеты.
+
+    We don't rely solely on model-level `nullable=False` because in real DBs
+    there can be legacy rows with NULLs/empty strings (e.g., after older
+    versions, manual imports, or partial writes).
+
+    This filter is used in "Valuta" so unfinished анкеты never appear.
+    """
+
+    return (
+        _nonempty_text(User.name)
+        & User.age.is_not(None)
+        & (User.age >= 9)
+        & (User.age <= 100)
+        & _nonempty_text(User.city)
+        & _nonempty_text(User.photo_file_id)
+        & User.gender.in_(["male", "female"])
+        & User.rate_pref.in_(["male", "female", "both"])
+        & User.be_rated_by.in_(["male", "female", "both"])
+    )
 
 
 class Rating(Base):
@@ -281,6 +315,7 @@ async def get_next_candidate(session: AsyncSession, viewer: User):
             .where(
                 User.tg_id != viewer.tg_id,
                 User.blocked.is_(False),
+                profile_complete_filter(),
             )
             .order_by(func.random())
             .limit(1)
@@ -325,6 +360,7 @@ async def get_top3(session: AsyncSession):
         .where(
             Rating.rated_photo_version == User.photo_version,
             User.blocked.is_(False),
+            profile_complete_filter(),
         )
         .group_by(User.tg_id, User.id)
         .having(func.count(Rating.id) > 0)
@@ -342,6 +378,7 @@ async def get_my_rank(session: AsyncSession, me: User):
         .where(
             Rating.rated_photo_version == User.photo_version,
             User.blocked.is_(False),
+            profile_complete_filter(),
         )
         .group_by(User.tg_id)
         .having(func.count(Rating.id) > 0)
