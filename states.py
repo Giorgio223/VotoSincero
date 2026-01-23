@@ -1,18 +1,27 @@
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.state import State, StatesGroup
+
 
 class Reg(StatesGroup):
     name = State()
     age = State()
     city = State()
     bio = State()
+    photo = State()
     gender = State()
     rate_pref = State()
     be_rated_by = State()
+
+
+class EditProfile(StatesGroup):
     photo = State()
+    gender = State()
+    age = State()
+    city = State()
+    bio = State()
+    be_rated_by = State()
+    rate_pref = State()
 
-class Rate(StatesGroup):
-    waiting_score = State()
-    waiting_message = State()
 
-class Admin(StatesGroup):
-    add_channel = State()
+class RateFlow(StatesGroup):
+    rating = State()
+    message = State()

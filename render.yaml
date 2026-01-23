@@ -1,19 +1,16 @@
 services:
-  - type: worker
-    name: votosincero-bot
-    runtime: python
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    envVars:
-      # Pin Python to a version that has prebuilt wheels for this project's deps.
-      # With the default Python 3.13 on Render, aiogram==3.4.1 pulls pydantic-core==2.14.6,
-      # which may fall back to building from source via Rust (maturin/cargo) and fail.
-      - key: PYTHON_VERSION
-        value: 3.12.12
-      - key: BOT_TOKEN
-        sync: false
-      - key: ADMIN_IDS
-        sync: false
-      - key: DB_URL
-        sync: false
+- type: worker
+  name: votosincero-bot
+  runtime: python
+  plan: starter
+  buildCommand: pip install -r requirements.txt
+  startCommand: python main.py
+  envVars:
+  - key: PYTHON_VERSION
+    value: 3.12.12
+  - key: BOT_TOKEN
+    sync: false
+  - key: ADMIN_IDS
+    sync: false
+  - key: DB_URL
+    sync: false

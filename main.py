@@ -1,181 +1,354 @@
 import asyncio
 import os
 import re
-from datetime import datetime
-from typing import Optional
+import aiohttp
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InputMediaPhoto
 from aiogram.fsm.context import FSMContext
-from aiogram.enums import ChatMemberStatus
-from sqlalchemy import select
 from dotenv import load_dotenv
 
 from db import (
     create_engine, create_sessionmaker, init_db,
-    get_user_by_tg_id, create_user, get_unseen_count, get_rating_stats,
-    get_candidate_to_rate, save_rating, fetch_unseen_ratings, mark_ratings_seen,
-    get_required_channels, add_report, list_all_channels, add_required_channel,
-    toggle_channel, list_reports, mark_report_reviewed, ban_user, unban_user,
+    get_user_by_tg_id, create_user, update_user_fields,
+    bump_photo_version_and_update_photo,
+    get_next_candidate, save_rating,
+    get_ratings_for_me_and_mark_seen,
+    get_my_rating_stats,
+    get_unseen_count,
+    get_top3, get_my_rank,
+    list_required_channels, add_required_channel, remove_required_channel,
+    create_report, get_report, list_open_reports, close_report, block_user, unblock_user,
 )
-from states import Reg, Rate, Admin
+from states import Reg, EditProfile, RateFlow
 from keyboards import (
-    main_menu, rating_top3_kb, required_channels_kb,
-    admin_menu, admin_channels_kb, admin_reports_kb, admin_report_actions_kb
+    main_menu_kb, profile_menu_kb, skip_bio_kb,
+    gender_kb, pref_kb, rating_kb,
+    leaderboard_inline_kb, admin_report_kb,
+    BTN_MY_PROFILE, BTN_RATE, BTN_WHO_RATED, BTN_LEADERBOARD,
+    BTN_BACK,
+    BTN_EDIT_PHOTO, BTN_EDIT_GENDER, BTN_EDIT_AGE, BTN_EDIT_CITY, BTN_EDIT_BIO,
+    BTN_EDIT_BE_RATED_BY, BTN_EDIT_RATE_PREF,
+    BTN_SKIP_BIO,
+    BTN_GENDER_MALE, BTN_GENDER_FEMALE,
+    BTN_PREF_MALE, BTN_PREF_FEMALE, BTN_PREF_BOTH,
+    BTN_RATE_MSG, BTN_RATE_REPORT,
 )
 
 load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Prod (Render/any VPS): set DB_URL (PostgreSQL, e.g. postgresql+asyncpg://...)
+# Local (Windows/dev): set DB_URL_LOCAL (SQLite, e.g. sqlite+aiosqlite:///votosincero.db)
+DB_URL = os.getenv("DB_URL") or os.getenv("DB_URL_LOCAL") or "sqlite+aiosqlite:///votosincero.db"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-DB_URL = os.getenv("DB_URL_LOCAL") or os.getenv("DB_URL") or ""
-ADMIN_IDS = {int(x) for x in (os.getenv("ADMIN_IDS","").split()) if x.strip().isdigit()}
+ADMIN_IDS = set()
+raw_admins = os.getenv("ADMIN_IDS", "").strip()
+if raw_admins:
+    for x in raw_admins.split(","):
+        x = x.strip()
+        if x.isdigit():
+            ADMIN_IDS.add(int(x))
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not DB_URL:
-    raise RuntimeError("DB_URL_LOCAL/DB_URL is missing")
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 engine = create_engine(DB_URL)
 SessionLocal = create_sessionmaker(engine)
 
-class BanGuardMiddleware(BaseMiddleware):
-    def __init__(self, session_factory):
-        super().__init__()
-        self.session_factory = session_factory
+BANNED_TEXT = "Sei stato bannato, per essere sbannato scrivi a @gioorgioo"
+
+
+class BlockMiddleware(BaseMiddleware):
+    """Если юзер заблокирован — отвечает текстом и не пускает дальше."""
 
     async def __call__(self, handler, event, data):
-        tg_id = getattr(getattr(event, "from_user", None), "id", None)
-        if tg_id is None:
+        tg_id = None
+        if hasattr(event, "from_user") and event.from_user:
+            tg_id = event.from_user.id
+
+        if not tg_id:
             return await handler(event, data)
-        async with self.session_factory() as session:
+
+        async with SessionLocal() as session:
             u = await get_user_by_tg_id(session, tg_id)
             if u and getattr(u, "blocked", False):
-                text = "Sei stato bannato, per essere sbannato scrivi a @gioorgioo"
-                # message
-                if isinstance(event, Message):
-                    await event.answer(text)
-                elif isinstance(event, CallbackQuery):
-                    await event.answer(text, show_alert=True)
+                if isinstance(event, CallbackQuery):
+                    # уберём "часики"
+                    try:
+                        await event.answer()
+                    except Exception:
+                        pass
+                    if event.message:
+                        await event.message.answer(BANNED_TEXT)
+                elif isinstance(event, Message):
+                    await event.answer(BANNED_TEXT)
                 return
+
         return await handler(event, data)
 
-dp = Dispatcher()
-dp.update.middleware(BanGuardMiddleware(SessionLocal))
 
-async def is_admin(user_id: int) -> bool:
+# Подключаем middleware на любые сообщения и callback-и
+dp.message.middleware(BlockMiddleware())
+dp.callback_query.middleware(BlockMiddleware())
+
+
+# ---------- Helpers ----------
+async def city_exists(city: str) -> bool:
+    city = city.strip()
+    if len(city) < 2:
+        return False
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": city, "format": "json", "limit": 1}
+    headers = {"User-Agent": "votosincero-bot/1.0"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=8) as r:
+                if r.status != 200:
+                    return False
+                data = await r.json()
+                return bool(data)
+    except Exception:
+        return False
+
+def gender_it(g: str) -> str:
+    return "👨 Uomo" if g == "male" else "👩 Donna"
+
+def pref_it(p: str) -> str:
+    if p == "male":
+        return "👨 Uomini"
+    if p == "female":
+        return "👩 Donne"
+    return "👥 Entrambi"
+
+def parse_gender_button(text: str) -> str | None:
+    if text == BTN_GENDER_MALE:
+        return "male"
+    if text == BTN_GENDER_FEMALE:
+        return "female"
+    return None
+
+def parse_pref_button(text: str) -> str | None:
+    if text == BTN_PREF_MALE:
+        return "male"
+    if text == BTN_PREF_FEMALE:
+        return "female"
+    if text == BTN_PREF_BOTH:
+        return "both"
+    return None
+
+def is_valid_name_or_username(s: str) -> bool:
+    s = s.strip()
+    if not (2 <= len(s) <= 32):
+        return False
+    if s.startswith("@"):
+        return bool(re.fullmatch(r"@[A-Za-z0-9_]{5,32}", s))
+    return True
+
+async def show_profile(message: Message, user, unread: int, with_profile_kb: bool):
+    async with SessionLocal() as session:
+        avg, cnt = await get_my_rating_stats(session, user)
+
+    rating_line = "⭐ Valutazione: —"
+    if avg is not None:
+        rating_line = f"⭐ Valutazione: {avg:.2f}/10  •  📊 Voti: {cnt}"
+
+    caption = (
+        f"👤 *Il tuo profilo*\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🪪 Nome: {user.name}\n"
+        f"🎂 Età: {user.age}\n"
+        f"📍 Città: {user.city}\n"
+        f"🚻 Genere: {gender_it(user.gender)}\n"
+        f"🔥 *Valuto:* {pref_it(user.rate_pref)}\n"
+        f"✅ *Mi valutano:* {pref_it(user.be_rated_by)}\n"
+        f"{rating_line}\n"
+        f"📝 Bio: {user.bio or '—'}\n"
+    )
+
+    kb = profile_menu_kb(unread) if with_profile_kb else main_menu_kb(unread)
+    await message.answer_photo(
+        photo=user.photo_file_id,
+        caption=caption,
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+async def send_candidate(message: Message, target_user, note: str | None = None):
+    caption = (
+        f"🔥 *Profilo da valutare*\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🪪 Nome: {target_user.name}\n"
+        f"🎂 Età: {target_user.age}\n"
+        f"📍 Città: {target_user.city}\n"
+        f"🚻 Genere: {gender_it(target_user.gender)}\n"
+        f"📝 Bio: {target_user.bio or '—'}\n"
+    )
+    if note:
+        caption += f"\n✅ {note}"
+
+    await message.answer_photo(
+        photo=target_user.photo_file_id,
+        caption=caption,
+        parse_mode="Markdown",
+        reply_markup=rating_kb(),
+    )
+
+def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-async def check_required_channels(bot: Bot, session, user_id: int) -> Optional[list[dict]]:
-    chans = await get_required_channels(session)
-    if not chans:
-        return None
-    missing=[]
-    for c in chans:
-        username = c.username
-        if not username:
-            continue
+async def check_required_subscriptions(user_id: int) -> tuple[bool, list[tuple[str, str | None]]]:
+    """
+    returns (ok, missing_list)
+    missing_list item: (title_or_username, link)
+    """
+    async with SessionLocal() as session:
+        channels = await list_required_channels(session)
+
+    missing = []
+    for ch in channels:
+        # username может быть "@channel" или "-100123..."
+        chat_id_or_username = ch.username
         try:
-            member = await bot.get_chat_member(chat_id=username, user_id=user_id)
-            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
-                missing.append({"username": username, "title": c.title, "link": c.link})
+            member = await bot.get_chat_member(chat_id_or_username, user_id)
+            # statuses: "member", "administrator", "creator", "restricted", "left", "kicked"
+            if member.status in ("left", "kicked"):
+                missing.append((ch.title or ch.username, ch.link))
         except Exception:
-            # if can't check (bot not admin in channel), still require join (best effort)
-            missing.append({"username": username, "title": c.title, "link": c.link})
-    return missing or None
+            # если бот не имеет доступа к каналу или username неправильный
+            missing.append((ch.title or ch.username, ch.link))
 
+    return (len(missing) == 0), missing
+
+async def send_subscribe_required(message: Message, missing: list[tuple[str, str | None]]):
+    lines = ["🔒 Per usare il bot devi iscriverti ai canali obbligatori:\n"]
+    for title, link in missing:
+        if link:
+            lines.append(f"• {title} → {link}")
+        else:
+            lines.append(f"• {title}")
+    lines.append("\n✅ Dopo l’iscrizione riprova a premere *🔥 Valuta*.")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+# ---------- /start ----------
 @dp.message(CommandStart())
-async def start_cmd(message: Message, state: FSMContext, bot: Bot):
+async def start(message: Message, state: FSMContext):
     async with SessionLocal() as session:
-        u = await get_user_by_tg_id(session, message.from_user.id)
-        unseen = await get_unseen_count(session, message.from_user.id)
-    if u:
-        await state.clear()
-        await message.answer("Menu:", reply_markup=main_menu(unseen))
-        return
-    await state.set_state(Reg.name)
-    await message.answer("Ciao! Scrivi il tuo nome oppure il tuo username seguito da @ (esempio @username)")
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        if not user:
+            await state.clear()
+            await state.set_state(Reg.name)
+            await message.answer("👋 Ciao! Scrivi il tuo nome oppure il tuo username seguito da @ (esempio @username)")
+            return
 
-@dp.message(Command("admin"))
-async def admin_cmd(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
+        if user.blocked:
+            await message.answer("🚫 Il tuo account è stato bloccato.")
+            return
+
+        unread = await get_unseen_count(session, user)
+
     await state.clear()
-    await message.answer("Admin menu:", reply_markup=admin_menu())
+    await show_profile(message, user, unread, with_profile_kb=False)
 
-@dp.message(F.text == "⬅️ Back")
-async def admin_back(message: Message):
-    async with SessionLocal() as session:
-        unseen = await get_unseen_count(session, message.from_user.id)
-    await message.answer("Menu:", reply_markup=main_menu(unseen))
 
-# ----- registration -----
+# ---------- Registration ----------
 @dp.message(Reg.name)
 async def reg_name(message: Message, state: FSMContext):
-    name = message.text.strip()
-    if not name:
+    name = (message.text or "").strip()
+    if not is_valid_name_or_username(name):
+        await message.answer("⚠️ Inserisci un nome valido oppure un username tipo *@username*.")
         return
     await state.update_data(name=name)
     await state.set_state(Reg.age)
-    await message.answer("Quanti anni hai? (18-99)")
+    await message.answer("🎂 Quanti anni hai? *(9–100)*", parse_mode="Markdown")
 
 @dp.message(Reg.age)
 async def reg_age(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        return await message.answer("Scrivi un numero (18-99)")
-    age = int(message.text)
-    if age < 18 or age > 99:
-        return await message.answer("Età non valida (18-99)")
+    try:
+        age = int((message.text or "").strip())
+    except Exception:
+        await message.answer("⚠️ L’età deve essere un numero. Esempio: *19*", parse_mode="Markdown")
+        return
+    if not (9 <= age <= 100):
+        await message.answer("⚠️ L’età deve essere tra *9* e *100*. Riprova.", parse_mode="Markdown")
+        return
+
     await state.update_data(age=age)
     await state.set_state(Reg.city)
-    await message.answer("In che città vivi?")
+    await message.answer("📍 Da dove vieni? Scrivi la *città* (controllerò se esiste).", parse_mode="Markdown")
 
 @dp.message(Reg.city)
 async def reg_city(message: Message, state: FSMContext):
-    await state.update_data(city=message.text.strip()[:64])
+    city = (message.text or "").strip()
+    if not await city_exists(city):
+        await message.answer("❌ Non trovo questa città. Riprova senza errori di scrittura.")
+        return
+
+    await state.update_data(city=city)
     await state.set_state(Reg.bio)
-    await message.answer("Scrivi una breve bio (opzionale). Invia '-' per saltare.")
+    await message.answer(
+        "📝 Scrivi una bio (esempio: Instagram: ...)\noppure premi *⏭️ Salta la bio*.",
+        parse_mode="Markdown",
+        reply_markup=skip_bio_kb()
+    )
 
 @dp.message(Reg.bio)
 async def reg_bio(message: Message, state: FSMContext):
-    bio = message.text.strip()
-    if bio == "-":
-        bio = ""
-    await state.update_data(bio=bio[:500])
+    if message.text == BTN_SKIP_BIO:
+        await state.update_data(bio=None)
+    else:
+        bio = (message.text or "").strip()
+        if len(bio) > 200:
+            await message.answer("⚠️ Troppo lunga (max 200). Riprova o premi *⏭️ Salta la bio*.", parse_mode="Markdown")
+            return
+        await state.update_data(bio=bio)
+
+    await state.set_state(Reg.photo)
+    await message.answer("🖼️ Ora invia una tua *foto* (solo foto, niente testo).", parse_mode="Markdown", reply_markup=None)
+
+@dp.message(Reg.photo)
+async def reg_photo(message: Message, state: FSMContext):
+    if not message.photo:
+        await message.answer("⚠️ Devi inviare *una foto* 🙂 Riprova.", parse_mode="Markdown")
+        return
+
+    photo_file_id = message.photo[-1].file_id
+    await state.update_data(photo_file_id=photo_file_id)
+
     await state.set_state(Reg.gender)
-    await message.answer("Sei maschio o femmina? (male/female)")
+    await message.answer("🚻 Seleziona il tuo genere:", reply_markup=gender_kb())
 
 @dp.message(Reg.gender)
 async def reg_gender(message: Message, state: FSMContext):
-    g = message.text.strip().lower()
-    if g not in ("male","female"):
-        return await message.answer("Scrivi: male oppure female")
-    await state.update_data(gender=g)
+    gender = parse_gender_button(message.text or "")
+    if not gender:
+        await message.answer("⚠️ Scegli usando i pulsanti qui sotto 👇", reply_markup=gender_kb())
+        return
+
+    await state.update_data(gender=gender)
     await state.set_state(Reg.rate_pref)
-    await message.answer("Chi vuoi valutare? (male/female/both)")
+    await message.answer("🔥 Chi vuoi valutare?", reply_markup=pref_kb())
 
 @dp.message(Reg.rate_pref)
 async def reg_rate_pref(message: Message, state: FSMContext):
-    rp = message.text.strip().lower()
-    if rp not in ("male","female","both"):
-        return await message.answer("Scrivi: male / female / both")
-    await state.update_data(rate_pref=rp)
+    rate_pref = parse_pref_button(message.text or "")
+    if not rate_pref:
+        await message.answer("⚠️ Scegli usando i pulsanti 👇", reply_markup=pref_kb())
+        return
+
+    await state.update_data(rate_pref=rate_pref)
     await state.set_state(Reg.be_rated_by)
-    await message.answer("Chi può valutarti? (male/female/both)")
+    await message.answer("✅ Chi vuoi che ti valuti?", reply_markup=pref_kb())
 
 @dp.message(Reg.be_rated_by)
 async def reg_be_rated_by(message: Message, state: FSMContext):
-    br = message.text.strip().lower()
-    if br not in ("male","female","both"):
-        return await message.answer("Scrivi: male / female / both")
-    await state.update_data(be_rated_by=br)
-    await state.set_state(Reg.photo)
-    await message.answer("Invia una tua foto.")
+    be_rated_by = parse_pref_button(message.text or "")
+    if not be_rated_by:
+        await message.answer("⚠️ Scegli usando i pulsanti 👇", reply_markup=pref_kb())
+        return
 
-@dp.message(Reg.photo, F.photo)
-async def reg_photo(message: Message, state: FSMContext):
     data = await state.get_data()
-    file_id = message.photo[-1].file_id
     async with SessionLocal() as session:
         await create_user(
             session,
@@ -183,244 +356,655 @@ async def reg_photo(message: Message, state: FSMContext):
             name=data["name"],
             age=data["age"],
             city=data["city"],
-            bio=data.get("bio",""),
-            photo_file_id=file_id,
+            bio=data.get("bio"),
+            photo_file_id=data["photo_file_id"],
             gender=data["gender"],
             rate_pref=data["rate_pref"],
-            be_rated_by=data["be_rated_by"],
+            be_rated_by=be_rated_by,
+            photo_version=1,
         )
-        unseen = await get_unseen_count(session, message.from_user.id)
+
     await state.clear()
-    await message.answer("Profilo creato ✅", reply_markup=main_menu(unseen))
+    await message.answer("✅ Registrazione completata!\n👉 Premi /start per vedere il menu.")
 
-@dp.message(Reg.photo)
-async def reg_photo_need(message: Message):
-    await message.answer("Per favore invia una foto (non un file).")
 
-# ----- profile -----
-@dp.message(F.text == "📊 Il mio profilo")
-async def my_profile(message: Message):
+# ---------- Menu ----------
+@dp.message(F.text == BTN_MY_PROFILE)
+async def my_profile(message: Message, state: FSMContext):
+    await state.clear()
     async with SessionLocal() as session:
-        u = await get_user_by_tg_id(session, message.from_user.id)
-        unseen = await get_unseen_count(session, message.from_user.id)
-        avg_, cnt_ = await get_rating_stats(session, message.from_user.id)
-    if not u:
-        return await message.answer("Usa /start per registrarti.")
-    txt = f"👤 {u.name}, {u.age}\n📍 {u.city}\n⭐ Rating: {avg_:.2f} ({cnt_})"
-    await message.answer_photo(u.photo_file_id, caption=txt, reply_markup=main_menu(unseen))
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        if not user:
+            await message.answer("⚠️ Non sei registrato. Premi /start.")
+            return
+        if user.blocked:
+            await message.answer("🚫 Il tuo account è stato bloccato.")
+            return
+        unread = await get_unseen_count(session, user)
 
-# ----- rate flow -----
-@dp.message(F.text == "⭐ Valuta")
-async def rate_start(message: Message, state: FSMContext, bot: Bot):
+    await show_profile(message, user, unread, with_profile_kb=True)
+
+@dp.message(F.text == BTN_BACK)
+async def back_to_main(message: Message, state: FSMContext):
+    await state.clear()
+    async with SessionLocal() as session:
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+    await message.answer("🏠 Menu principale:", reply_markup=main_menu_kb(unread))
+
+
+# ---------- Edit profile ----------
+@dp.message(F.text == BTN_EDIT_PHOTO)
+async def edit_photo_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.photo)
+    await message.answer(
+        "🖼️ Invia una nuova foto.\n\n"
+        "⚠️ *Attenzione:* cambiando foto, la tua valutazione (⭐) verrà *azzerata*.",
+        parse_mode="Markdown"
+    )
+
+@dp.message(EditProfile.photo)
+async def edit_photo_save(message: Message, state: FSMContext):
+    if not message.photo:
+        await message.answer("⚠️ Solo foto 🙂 Riprova.")
+        return
+
+    new_photo_id = message.photo[-1].file_id
+    async with SessionLocal() as session:
+        await bump_photo_version_and_update_photo(session, message.from_user.id, new_photo_id)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Foto aggiornata! ⭐ Valutazione azzerata.", reply_markup=profile_menu_kb(unread))
+
+@dp.message(F.text == BTN_EDIT_GENDER)
+async def edit_gender_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.gender)
+    await message.answer("🚻 Seleziona il tuo genere:", reply_markup=gender_kb())
+
+@dp.message(EditProfile.gender)
+async def edit_gender_save(message: Message, state: FSMContext):
+    gender = parse_gender_button(message.text or "")
+    if not gender:
+        await message.answer("⚠️ Scegli usando i pulsanti 👇", reply_markup=gender_kb())
+        return
+
+    async with SessionLocal() as session:
+        await update_user_fields(session, message.from_user.id, gender=gender)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Genere aggiornato!", reply_markup=profile_menu_kb(unread))
+
+@dp.message(F.text == BTN_EDIT_AGE)
+async def edit_age_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.age)
+    await message.answer("🎂 Scrivi la tua nuova età *(9–100)*:", parse_mode="Markdown")
+
+@dp.message(EditProfile.age)
+async def edit_age_save(message: Message, state: FSMContext):
+    try:
+        age = int((message.text or "").strip())
+    except Exception:
+        await message.answer("⚠️ L’età deve essere un numero. Riprova.")
+        return
+
+    if not (9 <= age <= 100):
+        await message.answer("⚠️ L’età deve essere tra 9 e 100. Riprova.")
+        return
+
+    async with SessionLocal() as session:
+        await update_user_fields(session, message.from_user.id, age=age)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Età aggiornata!", reply_markup=profile_menu_kb(unread))
+
+@dp.message(F.text == BTN_EDIT_CITY)
+async def edit_city_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.city)
+    await message.answer("📍 Scrivi la nuova città (controllerò se esiste).")
+
+@dp.message(EditProfile.city)
+async def edit_city_save(message: Message, state: FSMContext):
+    city = (message.text or "").strip()
+    if not await city_exists(city):
+        await message.answer("❌ Non trovo questa città. Riprova senza errori di scrittura.")
+        return
+
+    async with SessionLocal() as session:
+        await update_user_fields(session, message.from_user.id, city=city)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Città aggiornata!", reply_markup=profile_menu_kb(unread))
+
+@dp.message(F.text == BTN_EDIT_BIO)
+async def edit_bio_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.bio)
+    await message.answer(
+        "📝 Scrivi la nuova bio.\nOppure premi ⏭️ per rimuoverla.",
+        reply_markup=skip_bio_kb()
+    )
+
+@dp.message(EditProfile.bio)
+async def edit_bio_save(message: Message, state: FSMContext):
+    if message.text == BTN_SKIP_BIO:
+        bio = None
+    else:
+        bio = (message.text or "").strip()
+        if len(bio) > 200:
+            await message.answer("⚠️ Troppo lunga (max 200). Riprova.")
+            return
+
+    async with SessionLocal() as session:
+        await update_user_fields(session, message.from_user.id, bio=bio)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Bio aggiornata!", reply_markup=profile_menu_kb(unread))
+
+@dp.message(F.text == BTN_EDIT_BE_RATED_BY)
+async def edit_berated_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.be_rated_by)
+    await message.answer("✅ Chi vuoi che ti valuti?", reply_markup=pref_kb())
+
+@dp.message(EditProfile.be_rated_by)
+async def edit_berated_save(message: Message, state: FSMContext):
+    be_rated_by = parse_pref_button(message.text or "")
+    if not be_rated_by:
+        await message.answer("⚠️ Scegli usando i pulsanti 👇", reply_markup=pref_kb())
+        return
+
+    async with SessionLocal() as session:
+        await update_user_fields(session, message.from_user.id, be_rated_by=be_rated_by)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Preferenza aggiornata!", reply_markup=profile_menu_kb(unread))
+
+@dp.message(F.text == BTN_EDIT_RATE_PREF)
+async def edit_ratepref_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.rate_pref)
+    await message.answer("🔥 Chi vuoi valutare?", reply_markup=pref_kb())
+
+@dp.message(EditProfile.rate_pref)
+async def edit_ratepref_save(message: Message, state: FSMContext):
+    rate_pref = parse_pref_button(message.text or "")
+    if not rate_pref:
+        await message.answer("⚠️ Scegli usando i pulsanti 👇", reply_markup=pref_kb())
+        return
+
+    async with SessionLocal() as session:
+        await update_user_fields(session, message.from_user.id, rate_pref=rate_pref)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Preferenza aggiornata!", reply_markup=profile_menu_kb(unread))
+
+
+# ---------- Valuta + required channels ----------
+@dp.message(F.text == BTN_RATE)
+async def rate_start(message: Message, state: FSMContext):
+    await state.clear()
+
     async with SessionLocal() as session:
         viewer = await get_user_by_tg_id(session, message.from_user.id)
         if not viewer:
-            return await message.answer("Usa /start per registrarti.")
-        missing = await check_required_channels(bot, session, message.from_user.id)
-        if missing:
-            await message.answer("Devi iscriverti ai canali per usare il bot:", reply_markup=required_channels_kb(missing, after="rate"))
+            await message.answer("⚠️ Non sei registrato. Premi /start.")
             return
-        target = await get_candidate_to_rate(session, viewer)
-        unseen = await get_unseen_count(session, message.from_user.id)
-    if not target:
-        return await message.answer("Nessun profilo disponibile ora.", reply_markup=main_menu(unseen))
-    await state.set_state(Rate.waiting_score)
-    await state.update_data(target_tg_id=target.tg_id, target_photo_version=target.photo_version)
-    caption = f"👤 {target.name}, {target.age}\n📍 {target.city}\n{target.bio or ''}"
-    await message.answer_photo(target.photo_file_id, caption=caption, reply_markup=rating_top3_kb(target.tg_id))
+        if viewer.blocked:
+            await message.answer("🚫 Il tuo account è stato bloccato.")
+            return
 
-@dp.callback_query(F.data.startswith("req:"))
-async def required_done(cb: CallbackQuery, state: FSMContext, bot: Bot):
-    after = cb.data.split(":",1)[1]
-    async with SessionLocal() as session:
-        missing = await check_required_channels(bot, session, cb.from_user.id)
-    if missing:
-        await cb.answer("Ancora non sei iscritto a tutti.", show_alert=True)
+    ok, missing = await check_required_subscriptions(message.from_user.id)
+    if not ok:
+        await send_subscribe_required(message, missing)
         return
-    await cb.answer("Ok!")
-    if after == "rate":
-        # trigger rate menu via message
-        await cb.message.delete()
-        fake = Message.model_validate(cb.message.model_dump())
-        fake.from_user = cb.from_user
-        await rate_start(fake, state, bot)
-    else:
-        await cb.message.delete()
 
-@dp.callback_query(F.data.startswith("rate:"))
-async def rate_cb(cb: CallbackQuery, state: FSMContext):
-    parts = cb.data.split(":")
-    target_tg_id = int(parts[1])
-    score = int(parts[2])
-    data = await state.get_data()
-    # ensure matches current target
-    if data.get("target_tg_id") != target_tg_id:
-        await cb.answer("Questo profilo non è più attivo.", show_alert=True)
-        return
     async with SessionLocal() as session:
-        viewer = await get_user_by_tg_id(session, cb.from_user.id)
-        if not viewer:
-            return await cb.answer("Registrati con /start", show_alert=True)
-        await save_rating(session, viewer.tg_id, target_tg_id, int(data.get("target_photo_version",1)), score, None)
-        unseen = await get_unseen_count(session, cb.from_user.id)
-    await state.clear()
-    await cb.answer("Voto salvato ✅")
-    await cb.message.answer("Menu:", reply_markup=main_menu(unseen))
-    await cb.message.delete()
+        viewer = await get_user_by_tg_id(session, message.from_user.id)
+        candidate = await get_next_candidate(session, viewer)
+        unread = await get_unseen_count(session, viewer)
 
-@dp.callback_query(F.data.startswith("report:"))
-async def report_cb(cb: CallbackQuery, state: FSMContext):
-    target_tg_id = int(cb.data.split(":")[1])
-    await state.update_data(report_target=target_tg_id)
-    await state.set_state(Rate.waiting_message)
-    await cb.answer()
-    await cb.message.answer("Scrivi il motivo della segnalazione (o '-' per vuoto).")
+    if not candidate:
+        await message.answer("✅ Nessun profilo compatibile da valutare per ora.", reply_markup=main_menu_kb(unread))
+        return
 
-@dp.message(Rate.waiting_message)
-async def report_text(message: Message, state: FSMContext):
+    await state.set_state(RateFlow.rating)
+    await state.update_data(target_id=candidate.tg_id, pending_message=None)
+    await send_candidate(message, candidate)
+
+@dp.message(RateFlow.rating)
+async def rate_rating_input(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
     data = await state.get_data()
-    target = data.get("report_target")
-    if not target:
+    target_id = data.get("target_id")
+
+    if not target_id:
         await state.clear()
+        await message.answer("⚠️ Errore: nessun profilo attivo. Premi 🔥 Valuta.")
         return
-    text_ = message.text.strip()
-    if text_ == "-":
-        text_ = ""
-    async with SessionLocal() as session:
-        await add_report(session, message.from_user.id, int(target), text_)
-        unseen = await get_unseen_count(session, message.from_user.id)
-    await state.clear()
-    await message.answer("Segnalazione inviata ✅", reply_markup=main_menu(unseen))
 
-# ----- who rated me -----
-@dp.message(F.text.startswith("👀 Chi mi ha valutato"))
-async def who_rated_me(message: Message):
-    async with SessionLocal() as session:
-        u = await get_user_by_tg_id(session, message.from_user.id)
-        if not u:
-            return await message.answer("Usa /start per registrarti.")
-        items = await fetch_unseen_ratings(session, message.from_user.id, limit=5)
-        if not items:
-            unseen = await get_unseen_count(session, message.from_user.id)
-            return await message.answer("Nessuna nuova valutazione.", reply_markup=main_menu(unseen))
-        # mark seen
-        ids=[r.id for r in items]
-        await mark_ratings_seen(session, message.from_user.id, ids)
-        unseen = await get_unseen_count(session, message.from_user.id)
-
-    # send list (max 5)
-    txt = "📝 Nuove valutazioni:\n\n"
-    for r in items:
-        txt += f"⭐ {r.score}  | da {r.rater_tg_id}\n"
-        if r.message:
-            txt += f"💬 {r.message}\n"
-        txt += f"🕒 {r.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-    await message.answer(txt.strip(), reply_markup=main_menu(unseen))
-
-# ----- admin: required channels -----
-@dp.message(F.text == "🛠 Required channels")
-async def adm_channels(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
-    async with SessionLocal() as session:
-        items = await list_all_channels(session)
-    payload=[{"id":c.id,"username":c.username or "", "title":c.title or c.username or "", "is_active":c.is_active} for c in items]
-    await message.answer("Channels:", reply_markup=admin_channels_kb(payload))
-
-@dp.callback_query(F.data.startswith("admch:"))
-async def admch_cb(cb: CallbackQuery, state: FSMContext):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("No", show_alert=True)
-    cmd = cb.data.split(":",1)[1]
-    if cmd == "add":
-        await state.set_state(Admin.add_channel)
-        await cb.message.answer("Invia: @username | Titolo | link (link opzionale).")
-        await cb.answer()
-        return
-    channel_id = int(cmd)
-    async with SessionLocal() as session:
-        await toggle_channel(session, channel_id)
-        items = await list_all_channels(session)
-    payload=[{"id":c.id,"username":c.username or "", "title":c.title or c.username or "", "is_active":c.is_active} for c in items]
-    await cb.message.edit_text("Channels:", reply_markup=admin_channels_kb(payload))
-    await cb.answer("OK")
-
-@dp.message(Admin.add_channel)
-async def adm_add_channel(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
-    parts=[p.strip() for p in message.text.split("|")]
-    username = parts[0] if parts else ""
-    title = parts[1] if len(parts)>1 else ""
-    link = parts[2] if len(parts)>2 else ""
-    if username and not username.startswith("@"):
-        username = "@"+username
-    async with SessionLocal() as session:
-        await add_required_channel(session, username or None, title or None, link or None)
-        items = await list_all_channels(session)
-    payload=[{"id":c.id,"username":c.username or "", "title":c.title or c.username or "", "is_active":c.is_active} for c in items]
-    await state.clear()
-    await message.answer("Added ✅", reply_markup=admin_channels_kb(payload))
-
-# ----- admin: reports -----
-@dp.message(F.text == "🚨 Reports")
-async def adm_reports(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
-    async with SessionLocal() as session:
-        items = await list_reports(session, limit=20)
-    payload=[{"id":r.id, "reported_tg_id":r.reported_tg_id} for r in items]
-    if not payload:
-        return await message.answer("No reports.")
-    await message.answer("Reports:", reply_markup=admin_reports_kb(payload))
-
-@dp.callback_query(F.data.startswith("admr:"))
-async def admr_cb(cb: CallbackQuery):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("No", show_alert=True)
-    parts=cb.data.split(":")
-    if len(parts)>=3 and parts[1]=="done":
-        report_id=int(parts[2])
+    if text == BTN_BACK:
+        await state.clear()
         async with SessionLocal() as session:
-            await mark_report_reviewed(session, report_id)
-        await cb.answer("Done")
+            user = await get_user_by_tg_id(session, message.from_user.id)
+            unread = await get_unseen_count(session, user) if user else 0
+        await message.answer("🏠 Menu principale:", reply_markup=main_menu_kb(unread))
         return
-    report_id=int(parts[1])
-    async with SessionLocal() as session:
-        from db import Report
-        res = await session.execute(select(Report).where(Report.id==report_id))
-        r = res.scalar_one_or_none()
-    if not r:
-        return await cb.answer("Not found", show_alert=True)
-    text_ = f"Report #{r.id}\nReporter: {r.reporter_tg_id}\nReported: {r.reported_tg_id}\n\n{r.text}"
-    await cb.message.answer(text_, reply_markup=admin_report_actions_kb(r.id, r.reported_tg_id))
-    await cb.answer()
 
-@dp.callback_query(F.data.startswith("ban:"))
-async def ban_cb(cb: CallbackQuery):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("No", show_alert=True)
-    tg_id=int(cb.data.split(":")[1])
+    if text == BTN_RATE_MSG:
+        await state.set_state(RateFlow.message)
+        await message.answer("💬 Scrivi il messaggio (poi darai un voto 1–10).", reply_markup=None)
+        return
+
+    if text == BTN_RATE_REPORT:
+        async with SessionLocal() as session:
+            reporter = await get_user_by_tg_id(session, message.from_user.id)
+            reported = await get_user_by_tg_id(session, int(target_id))
+            if not reporter or not reported:
+                await message.answer("❌ Errore: profilo non trovato.")
+                return
+            rep = await create_report(session, reporter.tg_id, reported)
+
+        await message.answer("🚨 Segnalazione inviata ✅ Grazie!", reply_markup=rating_kb())
+
+        # уведомим админов
+        for admin_id in ADMIN_IDS:
+            try:
+                cap = (
+                    f"🚨 *NUOVA SEGNALAZIONE* (ID: {rep.id})\n"
+                    f"👤 Segnalato: {reported.name} ({reported.tg_id})\n"
+                    f"📍 {reported.city} • 🎂 {reported.age} • {gender_it(reported.gender)}\n"
+                    f"📝 Bio: {reported.bio or '—'}\n"
+                    f"📸 PhotoVersion: {reported.photo_version}\n"
+                    f"🙋 Reporter: {reporter.tg_id}"
+                )
+                await bot.send_photo(
+                    chat_id=admin_id,
+                    photo=reported.photo_file_id,
+                    caption=cap,
+                    parse_mode="Markdown",
+                    reply_markup=admin_report_kb(rep.id),
+                )
+            except Exception:
+                pass
+
+        return
+
+    if text.isdigit():
+        score = int(text)
+        if not (1 <= score <= 10):
+            await message.answer("⚠️ Scegli un numero da 1 a 10.", reply_markup=rating_kb())
+            return
+
+        pending_message = data.get("pending_message")
+
+        async with SessionLocal() as session:
+            viewer = await get_user_by_tg_id(session, message.from_user.id)
+            target = await get_user_by_tg_id(session, int(target_id))
+            if not viewer or not target:
+                await state.clear()
+                await message.answer("❌ Errore: profilo non trovato.")
+                return
+            if viewer.blocked:
+                await state.clear()
+                await message.answer("🚫 Il tuo account è stato bloccato.")
+                return
+
+            await save_rating(session, viewer.tg_id, target, score, pending_message)
+
+            next_one = await get_next_candidate(session, viewer)
+            unread = await get_unseen_count(session, viewer)
+
+        if not next_one:
+            await state.clear()
+            await message.answer("✅ Voto inviato!\nNon ci sono altri profili per ora.", reply_markup=main_menu_kb(unread))
+            return
+
+        await state.set_state(RateFlow.rating)
+        await state.update_data(target_id=next_one.tg_id, pending_message=None)
+        await message.answer("✅ Voto inviato! ➡️ Prossimo profilo:")
+        await send_candidate(message, next_one)
+        return
+
+    await message.answer("⚠️ Usa i pulsanti 👇", reply_markup=rating_kb())
+
+@dp.message(RateFlow.message)
+async def rate_message_input(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("⚠️ Messaggio vuoto. Riprova.")
+        return
+    if len(text) > 500:
+        await message.answer("⚠️ Troppo lungo (max 500). Riprova.")
+        return
+
+    await state.update_data(pending_message=text)
+    await state.set_state(RateFlow.rating)
+    await message.answer("✅ Messaggio salvato. Ora scegli un voto 1–10 👇", reply_markup=rating_kb())
+
+
+# ---------- Chi mi ha valutato ----------
+@dp.message(F.text.startswith(BTN_WHO_RATED))
+async def who_rated_me(message: Message, state: FSMContext):
+    await state.clear()
     async with SessionLocal() as session:
-        await ban_user(session, tg_id)
-    await cb.answer("Banned ✅", show_alert=True)
+        me = await get_user_by_tg_id(session, message.from_user.id)
+        if not me:
+            await message.answer("⚠️ Non sei registrato. Premi /start.")
+            return
+        if me.blocked:
+            await message.answer("🚫 Il tuo account è stato bloccato.")
+            return
+
+        # Отдаём ТОЛЬКО непросмотренные оценки, максимум 5 за раз
+        items = await get_ratings_for_me_and_mark_seen(session, me, limit=5)
+        # Сколько осталось непросмотренных после выдачи этой пачки
+        unread_after = await get_unseen_count(session, me)
+
+    if not items:
+        await message.answer("📭 Nessuna valutazione ancora 🙂", reply_markup=main_menu_kb(unread_after))
+        return
+
+    shown = len(items)
+    if unread_after > 0:
+        header = f"📬 Ultime valutazioni: mostro {shown} (restano {unread_after})"
+    else:
+        header = f"📬 Ultime valutazioni: mostro {shown} (fine)"
+    # ВАЖНО: тут обновляется кнопка "Chi mi ha valutato (N)" в клавиатуре
+    await message.answer(header, reply_markup=main_menu_kb(unread_after))
+
+    for rating, rater in items:
+        if not rater:
+            continue
+        caption = (
+            f"👤 *{rater.name}*  •  🎂 {rater.age}  •  📍 {rater.city}\n"
+            f"🚻 {gender_it(rater.gender)}\n"
+            f"📝 Bio: {rater.bio or '—'}\n\n"
+            f"⭐ *Voto:* {rating.score}/10\n"
+        )
+        if rating.message:
+            caption += f"💬 *Messaggio:* {rating.message}"
+        await message.answer_photo(photo=rater.photo_file_id, caption=caption, parse_mode="Markdown")
+
+
+# ---------- Classifica (1 сообщение, inline 1/2/3) ----------
+async def build_leaderboard_caption(top, my_rank):
+    lines = ["🏆 *Classifica TOP 3*"]
+    for i, (u, avg, cnt) in enumerate(top, start=1):
+        lines.append(f"{i}. {u.name} — ⭐ {float(avg):.2f}/10 • 📊 {int(cnt)}")
+    if my_rank is None:
+        lines.append("\n📍 La tua posizione: — (nessun voto ancora)")
+    else:
+        lines.append(f"\n📍 La tua posizione: *#{my_rank}*")
+    lines.append("\n👇 Premi 1/2 per vedere la foto.")
+    return "\n".join(lines)
+
+@dp.message(F.text == BTN_LEADERBOARD)
+async def leaderboard(message: Message, state: FSMContext):
+    await state.clear()
+    async with SessionLocal() as session:
+        me = await get_user_by_tg_id(session, message.from_user.id)
+        if not me:
+            await message.answer("⚠️ Non sei registrato. Premi /start.")
+            return
+        if me.blocked:
+            await message.answer("🚫 Il tuo account è stato bloccato.")
+            return
+
+        unread = await get_unseen_count(session, me)
+        top = await get_top3(session)
+        my_rank = await get_my_rank(session, me)
+
+    if not top:
+        await message.answer("🏆 Classifica vuota per ora 🙂", reply_markup=main_menu_kb(unread))
+        return
+
+    caption = await build_leaderboard_caption(top, my_rank)
+
+    # стартуем с #1 (одним фото-сообщением)
+    first_user = top[0][0]
+    await message.answer_photo(
+        photo=first_user.photo_file_id,
+        caption=caption,
+        parse_mode="Markdown",
+        reply_markup=leaderboard_inline_kb()
+    )
+
+@dp.callback_query(F.data.startswith("lb:"))
+async def leaderboard_cb(call: CallbackQuery):
+    action = call.data.split(":", 1)[1]
+    # Inline переключение TOP 3
+    if action not in ("1", "2", "3"):
+        await call.answer()
+        return
+
+    idx = int(action) - 1
+
+    async with SessionLocal() as session:
+        me = await get_user_by_tg_id(session, call.from_user.id)
+        if not me or me.blocked:
+            await call.answer("🚫 Accesso negato", show_alert=True)
+            return
+
+        top = await get_top3(session)
+        my_rank = await get_my_rank(session, me)
+
+    if idx >= len(top):
+        await call.answer("Non disponibile")
+        return
+
+    caption = await build_leaderboard_caption(top, my_rank)
+    chosen_user = top[idx][0]
+
+    # меняем фото в том же сообщении (одно сообщение, без спама)
+    media = InputMediaPhoto(media=chosen_user.photo_file_id, caption=caption, parse_mode="Markdown")
+    try:
+        await call.message.edit_media(media=media, reply_markup=leaderboard_inline_kb())
+    except Exception:
+        # если Telegram не даёт edit_media (редко), отправим отдельным фото
+        await call.message.answer_photo(photo=chosen_user.photo_file_id, caption=caption, parse_mode="Markdown", reply_markup=leaderboard_inline_kb())
+
+    await call.answer()
+
+
+# ---------- Admin: channels ----------
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "🛠️ *Admin*\n\n"
+        "📢 Canali obbligatori:\n"
+        "• `/addchannel @channel` (aggiunge)\n"
+        "• `/delchannel @channel` (rimuove)\n"
+        "• `/listchannels` (lista)\n\n"
+        "🚨 Segnalazioni arrivano automaticamente qui con bottoni.",
+        parse_mode="Markdown"
+    )
+
 
 @dp.message(Command("unban"))
-async def unban_cmd(message: Message):
-    if not await is_admin(message.from_user.id):
+async def admin_unban(message: Message):
+    if not is_admin(message.from_user.id):
         return
-    m = re.search(r"/unban\s+(\d+)", message.text or "")
-    if not m:
-        return await message.answer("Uso: /unban <tg_id>")
-    tg_id=int(m.group(1))
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer("Uso: `/unban 123456789`", parse_mode="Markdown")
+        return
+    tg_id = int(parts[1].strip())
     async with SessionLocal() as session:
-        await unban_user(session, tg_id)
-    await message.answer(f"Unbanned {tg_id} ✅")
+        await unblock_user(session, tg_id)
+    await message.answer(f"✅ Unbannato: {tg_id}")
 
+@dp.message(Command("listchannels"))
+async def admin_list_channels(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    async with SessionLocal() as session:
+        items = await list_required_channels(session)
+    if not items:
+        await message.answer("📢 Nessun canale obbligatorio.")
+        return
+    lines = ["📢 Canali obbligatori:"]
+    for ch in items:
+        lines.append(f"• {ch.username}  ({ch.title or '—'})  link: {ch.link or '—'}")
+    await message.answer("\n".join(lines))
+
+@dp.message(Command("addchannel"))
+async def admin_add_channel(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Uso: `/addchannel @channel` oppure `/addchannel -100123...`", parse_mode="Markdown")
+        return
+    username = parts[1].strip()
+
+    # Попробуем узнать title, link
+    title = None
+    link = None
+    try:
+        chat = await bot.get_chat(username)
+        title = chat.title
+        if chat.username:
+            link = f"https://t.me/{chat.username}"
+    except Exception:
+        pass
+
+    async with SessionLocal() as session:
+        try:
+            await add_required_channel(session, username=username, title=title, link=link)
+        except Exception:
+            await message.answer("⚠️ Non posso aggiungere (forse уже esiste).")
+            return
+
+
+    await message.answer(f"✅ Aggiunto: {username}\nTitolo: {title or '—'}\nLink: {link or '—'}")
+
+
+@dp.message(Command("delchannel"))
+async def admin_del_channel(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Uso: `/delchannel @channel` oppure `/delchannel -100123...`", parse_mode="Markdown")
+        return
+    username = parts[1].strip()
+
+    async with SessionLocal() as session:
+        ok = await remove_required_channel(session, username=username)
+
+    if ok:
+        await message.answer(f"✅ Rimosso: {username}")
+    else:
+        await message.answer("⚠️ Canale non trovato.")
+
+
+# ---------- Admin: reports list ----------
+@dp.message(Command("reports"))
+async def admin_reports(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    async with SessionLocal() as session:
+        items = await list_open_reports(session, limit=20, offset=0)
+
+    if not items:
+        await message.answer("✅ Nessuna segnalazione aperta.")
+        return
+
+    await message.answer(f"🚨 Segnalazioni aperte: {len(items)} (mostro le ultime 20)")
+    for rep, reported, reporter in items:
+        cap = (
+            f"🚨 *SEGNALAZIONE* (ID: {rep.id})\n"
+            f"👤 Segnalato: {reported.name} ({reported.tg_id})\n"
+            f"📍 {reported.city} • 🎂 {reported.age} • {gender_it(reported.gender)}\n"
+            f"📝 Bio: {reported.bio or '—'}\n"
+            f"📸 PhotoVersion: {reported.photo_version}\n"
+            f"🙋 Reporter: {rep.reporter_tg_id}\n"
+            f"🕒 {rep.created_at}"
+        )
+        try:
+            await message.answer_photo(
+                photo=reported.photo_file_id,
+                caption=cap,
+                parse_mode="Markdown",
+                reply_markup=admin_report_kb(rep.id),
+            )
+        except Exception:
+            await message.answer(cap, parse_mode="Markdown", reply_markup=admin_report_kb(rep.id))
+
+
+@dp.callback_query(F.data.startswith("rep:"))
+async def admin_report_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Accesso negato", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    if len(parts) != 3:
+        await call.answer()
+        return
+
+    action, report_id_s = parts[1], parts[2]
+    if not report_id_s.isdigit():
+        await call.answer()
+        return
+    report_id = int(report_id_s)
+
+    async with SessionLocal() as session:
+        rep = await get_report(session, report_id)
+        if not rep:
+            await call.answer("Non trovato")
+            return
+
+        reported = await get_user_by_tg_id(session, int(rep.reported_tg_id))
+
+        if action == "block":
+            if reported:
+                await block_user(session, reported.tg_id)
+            await close_report(session, report_id)
+            await call.answer("Utente bloccato")
+
+            # обновим сообщение
+            try:
+                if call.message and call.message.caption:
+                    new_cap = call.message.caption + "\n\n🚫 *BLOCCATO*"
+                    await call.message.edit_caption(new_cap, parse_mode="Markdown", reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action == "close":
+            await close_report(session, report_id)
+            await call.answer("Chiusa")
+            try:
+                if call.message and call.message.caption:
+                    new_cap = call.message.caption + "\n\n✅ *CHIUSA*"
+                    await call.message.edit_caption(new_cap, parse_mode="Markdown", reply_markup=None)
+            except Exception:
+                pass
+            return
+
+    await call.answer()
+
+
+# ---------- Run ----------
 async def main():
-    bot = Bot(BOT_TOKEN)
     await init_db(engine)
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
