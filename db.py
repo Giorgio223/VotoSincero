@@ -153,6 +153,15 @@ async def get_user_by_tg_id(session: AsyncSession, tg_id: int) -> User | None:
     res = await session.execute(select(User).where(User.tg_id == tg_id))
     return res.scalar_one_or_none()
 
+async def list_all_user_tg_ids(session: AsyncSession, include_blocked: bool = True) -> list[int]:
+    q = select(User.tg_id)
+    if not include_blocked:
+        q = q.where(User.blocked.is_(False))
+    res = await session.execute(q)
+    return [int(x) for (x,) in res.all()]
+
+
+
 
 async def create_user(
     session: AsyncSession,
@@ -353,9 +362,40 @@ async def get_next_candidate(session: AsyncSession, viewer: User):
 
 
 # ---------- Leaderboard ----------
-async def get_top3(session: AsyncSession):
+async def _global_avg_for_leaderboard(session: AsyncSession) -> float:
+    """Global mean rating (C) considering only current photo_version votes of valid profiles."""
     q = (
-        select(User, func.avg(Rating.score).label("avg_score"), func.count(Rating.id).label("cnt"))
+        select(func.avg(Rating.score))
+        .join(User, User.tg_id == Rating.rated_tg_id)
+        .where(
+            Rating.rated_photo_version == User.photo_version,
+            User.blocked.is_(False),
+            profile_complete_filter(),
+        )
+    )
+    res = await session.execute(q)
+    return float(res.scalar() or 0.0)
+
+
+def _bayesian_score(avg_score_expr, cnt_expr, global_avg: float, m: int = 20):
+    """IMDb-style Bayesian average: (v/(v+m))*R + (m/(v+m))*C"""
+    v = cnt_expr
+    R = avg_score_expr
+    C = global_avg
+    return (v / (v + m)) * R + (m / (v + m)) * C
+
+
+# ---------- Leaderboard ----------
+async def get_top3(session: AsyncSession):
+    global_avg = await _global_avg_for_leaderboard(session)
+    m = 20  # "minimum votes" smoothing constant (tweak if needed)
+
+    avg_expr = func.avg(Rating.score)
+    cnt_expr = func.count(Rating.id)
+    score_expr = _bayesian_score(avg_expr, cnt_expr, global_avg, m).label("score")
+
+    q = (
+        select(User, avg_expr.label("avg_score"), cnt_expr.label("cnt"), score_expr)
         .join(Rating, Rating.rated_tg_id == User.tg_id)
         .where(
             Rating.rated_photo_version == User.photo_version,
@@ -363,17 +403,26 @@ async def get_top3(session: AsyncSession):
             profile_complete_filter(),
         )
         .group_by(User.tg_id, User.id)
-        .having(func.count(Rating.id) > 0)
-        .order_by(func.avg(Rating.score).desc(), func.count(Rating.id).desc())
+        .having(cnt_expr > 0)
+        .order_by(score_expr.desc(), cnt_expr.desc())
         .limit(3)
     )
     res = await session.execute(q)
-    return res.all()
+    # return items as (User, avg, cnt) like before for compatibility
+    rows = res.all()
+    return [(u, avg, cnt) for (u, avg, cnt, _score) in rows]
 
 
 async def get_my_rank(session: AsyncSession, me: User):
+    global_avg = await _global_avg_for_leaderboard(session)
+    m = 20
+
+    avg_expr = func.avg(Rating.score)
+    cnt_expr = func.count(Rating.id)
+    score_expr = _bayesian_score(avg_expr, cnt_expr, global_avg, m).label("score")
+
     q = (
-        select(User.tg_id, func.avg(Rating.score).label("avg_score"), func.count(Rating.id).label("cnt"))
+        select(User.tg_id, avg_expr.label("avg_score"), cnt_expr.label("cnt"), score_expr)
         .join(Rating, Rating.rated_tg_id == User.tg_id)
         .where(
             Rating.rated_photo_version == User.photo_version,
@@ -381,15 +430,17 @@ async def get_my_rank(session: AsyncSession, me: User):
             profile_complete_filter(),
         )
         .group_by(User.tg_id)
-        .having(func.count(Rating.id) > 0)
-        .order_by(func.avg(Rating.score).desc(), func.count(Rating.id).desc())
+        .having(cnt_expr > 0)
+        .order_by(score_expr.desc(), cnt_expr.desc())
     )
     res = await session.execute(q)
     rows = res.all()
-    for idx, (tg_id, _, __) in enumerate(rows, start=1):
+    for idx, (tg_id, _, __, ___) in enumerate(rows, start=1):
         if tg_id == me.tg_id:
             return idx
     return None
+
+
 
 
 # ---------- Required channels ----------
