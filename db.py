@@ -7,8 +7,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, aliased
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
 # ---------- Helpers ----------
@@ -149,21 +147,6 @@ async def init_db(engine):
             # Если он уже был создан раньше — удалим.
             await conn.execute(text("ALTER TABLE ratings DROP CONSTRAINT IF EXISTS uq_rater_rated_version"))
 
-            # В некоторых ранних деплоях мог быть создан другой UNIQUE,
-            # который запрещает повторную оценку, пока предыдущая не просмотрена,
-            # но без учёта версии фото. Это ломает нашу логику (разрешаем оценку
-            # новой версии фото независимо от старой).
-            await conn.execute(text("ALTER TABLE ratings DROP CONSTRAINT IF EXISTS uq_rater_rated_unseen"))
-            await conn.execute(text("DROP INDEX IF EXISTS uq_rater_rated_unseen"))
-
-            # Вместо этого держим уникальность только для 'непросмотренной' оценки
-            # В РАМКАХ ОДНОЙ ВЕРСИИ ФОТО. Это защищает от дабл-кликов/повторов.
-            await conn.execute(text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_rater_rated_unseen_idx "
-                "ON ratings (rater_tg_id, rated_tg_id, rated_photo_version) "
-                "WHERE seen = FALSE"
-            ))
-
 
 # ---------- Users ----------
 async def get_user_by_tg_id(session: AsyncSession, tg_id: int) -> User | None:
@@ -252,80 +235,20 @@ async def list_all_user_tg_ids(session: AsyncSession, include_blocked: bool = Fa
 
 # ---------- Ratings ----------
 async def save_rating(session: AsyncSession, rater_tg_id: int, rated_user: User, score: int, message: str | None):
-    """Persist a rating.
-
-    В проде часто встречается двойной клик по кнопке (Telegram повторяет update)
-    или гонка, когда одна и та же оценка пытается записаться дважды.
-
-    Также в старых БД мог оставаться UNIQUE на unseen-оценку без учёта версии фото.
-    Мы его удаляем в init_db, но на всякий случай делаем запись идемпотентной:
-    если unseen-оценка на эту же версию фото уже есть — обновляем её.
-    """
-
-    now = datetime.utcnow()
-
-    # Оптимальный путь для PostgreSQL: UPSERT по нашему парциальному индексу.
-    if session.bind and session.bind.dialect.name == "postgresql":
-        t = Rating.__table__
-        stmt = (
-            pg_insert(t)
-            .values(
-                rater_tg_id=rater_tg_id,
-                rated_tg_id=rated_user.tg_id,
-                score=score,
-                message=message,
-                rated_photo_version=rated_user.photo_version,
-                seen=False,
-                created_at=now,
-            )
-            .on_conflict_do_update(
-                index_elements=[t.c.rater_tg_id, t.c.rated_tg_id, t.c.rated_photo_version],
-                index_where=(t.c.seen.is_(False)),
-                set_={
-                    "score": score,
-                    "message": message,
-                    "created_at": now,
-                },
-            )
-            .returning(t.c.id)
-        )
-
-        res = await session.execute(stmt)
-        rid = int(res.scalar_one())
-        r = await session.get(Rating, rid)
-    else:
-        # SQLite / fallback: обычная вставка + обработка ошибки
-        r = Rating(
-            rater_tg_id=rater_tg_id,
-            rated_tg_id=rated_user.tg_id,
-            score=score,
-            message=message,
-            rated_photo_version=rated_user.photo_version,
-            seen=False,
-            created_at=now,
-        )
-        session.add(r)
-        try:
-            await session.flush()
-        except IntegrityError:
-            await session.rollback()
-            # Если уже есть unseen запись — обновим её
-            await session.execute(
-                update(Rating)
-                .where(
-                    Rating.rater_tg_id == rater_tg_id,
-                    Rating.rated_tg_id == rated_user.tg_id,
-                    Rating.rated_photo_version == rated_user.photo_version,
-                    Rating.seen.is_(False),
-                )
-                .values(score=score, message=message, created_at=now)
-            )
-
+    r = Rating(
+        rater_tg_id=rater_tg_id,
+        rated_tg_id=rated_user.tg_id,
+        score=score,
+        message=message,
+        rated_photo_version=rated_user.photo_version,
+        seen=False,
+    )
+    session.add(r)
     # отметим активность того, кто ставит оценку
     await session.execute(
         update(User)
         .where(User.tg_id == rater_tg_id)
-        .values(last_active_at=now)
+        .values(last_active_at=datetime.utcnow())
     )
     await session.commit()
     return r
