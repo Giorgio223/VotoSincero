@@ -220,6 +220,15 @@ async def unblock_user(session: AsyncSession, tg_id: int):
     await session.commit()
 
 
+async def list_all_user_tg_ids(session: AsyncSession, include_blocked: bool = True) -> list[int]:
+    """Return tg_id of every user who has ever started the bot."""
+    q = select(User.tg_id)
+    if not include_blocked:
+        q = q.where(User.blocked.is_(False))
+    res = await session.execute(q)
+    return [int(x) for (x,) in res.all()]
+
+
 # ---------- Ratings ----------
 async def save_rating(session: AsyncSession, rater_tg_id: int, rated_user: User, score: int, message: str | None):
     r = Rating(
@@ -354,42 +363,103 @@ async def get_next_candidate(session: AsyncSession, viewer: User):
 
 # ---------- Leaderboard ----------
 async def get_top3(session: AsyncSession):
+    """Top 3 with "rating + volume" logic.
+
+    We use a Bayesian weighted rating:
+        score = (v/(v+m))*R + (m/(v+m))*C
+    where
+        R = user's average rating (current photo_version only)
+        v = number of ratings
+        C = global average rating (same filtering)
+        m = минимальный порог голосов, чтобы "доверять" среднему (по умолчанию 10)
+
+    This prevents a single 10/10 from outranking someone with many high votes.
+    """
+    m = 10.0
+
+    avg_r = func.avg(Rating.score)
+    cnt_r = func.count(Rating.id)
+
+    base_filter = (
+        (Rating.rated_photo_version == User.photo_version)
+        & User.blocked.is_(False)
+        & profile_complete_filter()
+    )
+
+    global_avg_sq = (
+        select(func.avg(Rating.score))
+        .join(User, User.tg_id == Rating.rated_tg_id)
+        .where(base_filter)
+        .scalar_subquery()
+    )
+
     q = (
-        select(User, func.avg(Rating.score).label("avg_score"), func.count(Rating.id).label("cnt"))
-        .join(Rating, Rating.rated_tg_id == User.tg_id)
-        .where(
-            Rating.rated_photo_version == User.photo_version,
-            User.blocked.is_(False),
-            profile_complete_filter(),
+        select(
+            User,
+            avg_r.label("avg_score"),
+            cnt_r.label("cnt"),
+            (
+                (cnt_r / (cnt_r + m)) * avg_r
+                + (m / (cnt_r + m)) * func.coalesce(global_avg_sq, 0)
+            ).label("bayes_score"),
         )
+        .join(Rating, Rating.rated_tg_id == User.tg_id)
+        .where(base_filter)
         .group_by(User.tg_id, User.id)
-        .having(func.count(Rating.id) > 0)
-        .order_by(func.avg(Rating.score).desc(), func.count(Rating.id).desc())
+        .having(cnt_r > 0)
+        .order_by(text("bayes_score DESC"), cnt_r.desc(), avg_r.desc())
         .limit(3)
     )
     res = await session.execute(q)
-    return res.all()
+    # keep output shape compatible with old code: (User, avg, cnt)
+    out = []
+    for u, avg, cnt, _bayes in res.all():
+        out.append((u, avg, cnt))
+    return out
+
 
 
 async def get_my_rank(session: AsyncSession, me: User):
+    m = 10.0
+    avg_r = func.avg(Rating.score)
+    cnt_r = func.count(Rating.id)
+
+    base_filter = (
+        (Rating.rated_photo_version == User.photo_version)
+        & User.blocked.is_(False)
+        & profile_complete_filter()
+    )
+
+    global_avg_sq = (
+        select(func.avg(Rating.score))
+        .join(User, User.tg_id == Rating.rated_tg_id)
+        .where(base_filter)
+        .scalar_subquery()
+    )
+
     q = (
-        select(User.tg_id, func.avg(Rating.score).label("avg_score"), func.count(Rating.id).label("cnt"))
-        .join(Rating, Rating.rated_tg_id == User.tg_id)
-        .where(
-            Rating.rated_photo_version == User.photo_version,
-            User.blocked.is_(False),
-            profile_complete_filter(),
+        select(
+            User.tg_id,
+            (
+                (cnt_r / (cnt_r + m)) * avg_r
+                + (m / (cnt_r + m)) * func.coalesce(global_avg_sq, 0)
+            ).label("bayes_score"),
+            cnt_r.label("cnt"),
+            avg_r.label("avg_score"),
         )
+        .join(Rating, Rating.rated_tg_id == User.tg_id)
+        .where(base_filter)
         .group_by(User.tg_id)
-        .having(func.count(Rating.id) > 0)
-        .order_by(func.avg(Rating.score).desc(), func.count(Rating.id).desc())
+        .having(cnt_r > 0)
+        .order_by(text("bayes_score DESC"), cnt_r.desc(), avg_r.desc())
     )
     res = await session.execute(q)
     rows = res.all()
-    for idx, (tg_id, _, __) in enumerate(rows, start=1):
-        if tg_id == me.tg_id:
+    for idx, (tg_id, _score, _cnt, _avg) in enumerate(rows, start=1):
+        if int(tg_id) == int(me.tg_id):
             return idx
     return None
+
 
 
 # ---------- Required channels ----------

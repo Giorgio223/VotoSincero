@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import html
 import aiohttp
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -20,6 +21,7 @@ from db import (
     get_top3, get_my_rank,
     list_required_channels, add_required_channel, remove_required_channel,
     create_report, get_report, list_open_reports, close_report, block_user, unblock_user,
+    list_all_user_tg_ids,
 )
 from states import Reg, EditProfile, RateFlow
 from keyboards import (
@@ -28,7 +30,7 @@ from keyboards import (
     leaderboard_inline_kb, admin_report_kb,
     BTN_MY_PROFILE, BTN_RATE, BTN_WHO_RATED, BTN_LEADERBOARD,
     BTN_BACK,
-    BTN_EDIT_PHOTO, BTN_EDIT_GENDER, BTN_EDIT_AGE, BTN_EDIT_CITY, BTN_EDIT_BIO,
+    BTN_EDIT_NAME, BTN_EDIT_PHOTO, BTN_EDIT_GENDER, BTN_EDIT_AGE, BTN_EDIT_CITY, BTN_EDIT_BIO,
     BTN_EDIT_BE_RATED_BY, BTN_EDIT_RATE_PREF,
     BTN_SKIP_BIO,
     BTN_GENDER_MALE, BTN_GENDER_FEMALE,
@@ -175,24 +177,36 @@ async def show_profile(message: Message, user, unread: int, with_profile_kb: boo
     )
 
 async def send_candidate(message: Message, target_user, note: str | None = None):
+    # ВАЖНО: пользовательские данные могут содержать символы Markdown (_ * [ ] и т.д.).
+    # Поэтому используем HTML + экранирование, иначе Telegram иногда ломает отправку подписи.
     caption = (
-        f"🔥 *Profilo da valutare*\n"
+        f"🔥 <b>Profilo da valutare</b>\n"
         f"━━━━━━━━━━━━━━\n"
-        f"🪪 Nome: {target_user.name}\n"
-        f"🎂 Età: {target_user.age}\n"
-        f"📍 Città: {target_user.city}\n"
-        f"🚻 Genere: {gender_it(target_user.gender)}\n"
-        f"📝 Bio: {target_user.bio or '—'}\n"
+        f"🪪 Nome: {html.escape(str(target_user.name or ''))}\n"
+        f"🎂 Età: {html.escape(str(target_user.age or ''))}\n"
+        f"📍 Città: {html.escape(str(target_user.city or ''))}\n"
+        f"🚻 Genere: {html.escape(gender_it(target_user.gender))}\n"
+        f"📝 Bio: {html.escape(str(target_user.bio or '—'))}\n"
     )
     if note:
-        caption += f"\n✅ {note}"
+        caption += f"\n✅ {html.escape(str(note))}"
 
-    await message.answer_photo(
-        photo=target_user.photo_file_id,
-        caption=caption,
-        parse_mode="Markdown",
-        reply_markup=rating_kb(),
-    )
+    try:
+        await message.answer_photo(
+            photo=target_user.photo_file_id,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=rating_kb(),
+        )
+    except Exception:
+        # Фоллбек: если фото/подпись не отправились (битый file_id, ограничения Telegram и т.п.)
+        # показываем анкету текстом, чтобы диалог не "зависал".
+        await message.answer(
+            caption,
+            parse_mode="HTML",
+            reply_markup=rating_kb(),
+        )
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -394,6 +408,26 @@ async def back_to_main(message: Message, state: FSMContext):
 
 
 # ---------- Edit profile ----------
+@dp.message(F.text == BTN_EDIT_NAME)
+async def edit_name_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.name)
+    await message.answer("🪪 Scrivi il nuovo nome (oppure @username).")
+
+@dp.message(EditProfile.name)
+async def edit_name_save(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not is_valid_name_or_username(name):
+        await message.answer("⚠️ Nome non valido. Usa 2–32 символа, можно @username.")
+        return
+
+    async with SessionLocal() as session:
+        await update_user_fields(session, message.from_user.id, name=name)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Nome aggiornato!", reply_markup=profile_menu_kb(unread))
+
 @dp.message(F.text == BTN_EDIT_PHOTO)
 async def edit_photo_start(message: Message, state: FSMContext):
     await state.set_state(EditProfile.photo)
@@ -832,6 +866,35 @@ async def admin_panel(message: Message):
         parse_mode="Markdown"
     )
 
+
+@dp.message(Command("broadcast"))
+async def admin_broadcast(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Uso: `/broadcast testo del messaggio`", parse_mode="Markdown")
+        return
+
+    text_to_send = parts[1].strip()
+
+    async with SessionLocal() as session:
+        user_ids = await list_all_user_tg_ids(session, include_blocked=True)
+
+    sent = 0
+    failed = 0
+
+    # Telegram limits: keep small delay
+    for uid in user_ids:
+        try:
+            await bot.send_message(chat_id=uid, text=text_to_send)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await message.answer(f"📨 Broadcast finito.\n✅ Inviati: {sent}\n❌ Falliti: {failed}")
 
 @dp.message(Command("unban"))
 async def admin_unban(message: Message):
