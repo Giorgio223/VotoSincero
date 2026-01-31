@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import html
 import aiohttp
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -176,36 +175,24 @@ async def show_profile(message: Message, user, unread: int, with_profile_kb: boo
     )
 
 async def send_candidate(message: Message, target_user, note: str | None = None):
-    # ВАЖНО: пользовательские данные могут содержать символы Markdown (_ * [ ] и т.д.).
-    # Поэтому используем HTML + экранирование, иначе Telegram иногда ломает отправку подписи.
     caption = (
-        f"🔥 <b>Profilo da valutare</b>\n"
+        f"🔥 *Profilo da valutare*\n"
         f"━━━━━━━━━━━━━━\n"
-        f"🪪 Nome: {html.escape(str(target_user.name or ''))}\n"
-        f"🎂 Età: {html.escape(str(target_user.age or ''))}\n"
-        f"📍 Città: {html.escape(str(target_user.city or ''))}\n"
-        f"🚻 Genere: {html.escape(gender_it(target_user.gender))}\n"
-        f"📝 Bio: {html.escape(str(target_user.bio or '—'))}\n"
+        f"🪪 Nome: {target_user.name}\n"
+        f"🎂 Età: {target_user.age}\n"
+        f"📍 Città: {target_user.city}\n"
+        f"🚻 Genere: {gender_it(target_user.gender)}\n"
+        f"📝 Bio: {target_user.bio or '—'}\n"
     )
     if note:
-        caption += f"\n✅ {html.escape(str(note))}"
+        caption += f"\n✅ {note}"
 
-    try:
-        await message.answer_photo(
-            photo=target_user.photo_file_id,
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=rating_kb(),
-        )
-    except Exception:
-        # Фоллбек: если фото/подпись не отправились (битый file_id, ограничения Telegram и т.п.)
-        # показываем анкету текстом, чтобы диалог не "зависал".
-        await message.answer(
-            caption,
-            parse_mode="HTML",
-            reply_markup=rating_kb(),
-        )
-
+    await message.answer_photo(
+        photo=target_user.photo_file_id,
+        caption=caption,
+        parse_mode="Markdown",
+        reply_markup=rating_kb(),
+    )
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
