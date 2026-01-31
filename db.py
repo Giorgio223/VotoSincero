@@ -202,15 +202,6 @@ async def bump_photo_version_and_update_photo(session: AsyncSession, tg_id: int,
     await session.commit()
 
 
-async def list_all_user_tg_ids(session: AsyncSession) -> list[int]:
-    """All users who ever registered (/start -> registration).
-
-    Used for admin broadcast.
-    """
-    res = await session.execute(select(User.tg_id).order_by(User.id.asc()))
-    return [int(x) for (x,) in res.all()]
-
-
 async def block_user(session: AsyncSession, tg_id: int):
     await session.execute(
         update(User)
@@ -363,38 +354,8 @@ async def get_next_candidate(session: AsyncSession, viewer: User):
 
 # ---------- Leaderboard ----------
 async def get_top3(session: AsyncSession):
-    """TOP 3 with a score that учитывает и среднюю оценку, и число оценок.
-
-    We use a Bayesian average:
-      score = (v/(v+m))*R + (m/(v+m))*C
-    where:
-      R = user's avg rating, v = number of ratings,
-      C = global average rating (across current photo versions),
-      m = минимальное "доверие" (the higher, the more we require volume).
-    """
-
-    m = 20  # tuning knob: ~20 votes to be considered "reliable"
-
-    # global average across *current* profiles only (photo_version-aware)
-    global_avg_q = (
-        select(func.avg(Rating.score))
-        .select_from(Rating)
-        .join(User, User.tg_id == Rating.rated_tg_id)
-        .where(
-            Rating.rated_photo_version == User.photo_version,
-            User.blocked.is_(False),
-            profile_complete_filter(),
-        )
-    )
-    global_avg = float((await session.execute(global_avg_q)).scalar() or 0.0)
-
-    cnt = func.count(Rating.id)
-    avg = func.avg(Rating.score)
-    # Bayesian score expression
-    score_expr = (cnt / (cnt + m)) * avg + (m / (cnt + m)) * global_avg
-
     q = (
-        select(User, avg.label("avg_score"), cnt.label("cnt"))
+        select(User, func.avg(Rating.score).label("avg_score"), func.count(Rating.id).label("cnt"))
         .join(Rating, Rating.rated_tg_id == User.tg_id)
         .where(
             Rating.rated_photo_version == User.photo_version,
@@ -402,8 +363,8 @@ async def get_top3(session: AsyncSession):
             profile_complete_filter(),
         )
         .group_by(User.tg_id, User.id)
-        .having(cnt > 0)
-        .order_by(score_expr.desc(), cnt.desc(), avg.desc())
+        .having(func.count(Rating.id) > 0)
+        .order_by(func.avg(Rating.score).desc(), func.count(Rating.id).desc())
         .limit(3)
     )
     res = await session.execute(q)
@@ -411,29 +372,8 @@ async def get_top3(session: AsyncSession):
 
 
 async def get_my_rank(session: AsyncSession, me: User):
-    m = 20
-
-    global_avg_q = (
-        select(func.avg(Rating.score))
-        .select_from(Rating)
-        .join(User, User.tg_id == Rating.rated_tg_id)
-        .where(
-            Rating.rated_photo_version == User.photo_version,
-            User.blocked.is_(False),
-            profile_complete_filter(),
-        )
-    )
-    global_avg = float((await session.execute(global_avg_q)).scalar() or 0.0)
-
-    cnt = func.count(Rating.id)
-    avg = func.avg(Rating.score)
-    score_expr = (cnt / (cnt + m)) * avg + (m / (cnt + m)) * global_avg
-
-    ranked = (
-        select(
-            User.tg_id.label("tg_id"),
-            func.row_number().over(order_by=(score_expr.desc(), cnt.desc(), avg.desc())).label("rk"),
-        )
+    q = (
+        select(User.tg_id, func.avg(Rating.score).label("avg_score"), func.count(Rating.id).label("cnt"))
         .join(Rating, Rating.rated_tg_id == User.tg_id)
         .where(
             Rating.rated_photo_version == User.photo_version,
@@ -441,13 +381,15 @@ async def get_my_rank(session: AsyncSession, me: User):
             profile_complete_filter(),
         )
         .group_by(User.tg_id)
-        .having(cnt > 0)
-        .subquery()
+        .having(func.count(Rating.id) > 0)
+        .order_by(func.avg(Rating.score).desc(), func.count(Rating.id).desc())
     )
-
-    res = await session.execute(select(ranked.c.rk).where(ranked.c.tg_id == me.tg_id))
-    rk = res.scalar_one_or_none()
-    return int(rk) if rk is not None else None
+    res = await session.execute(q)
+    rows = res.all()
+    for idx, (tg_id, _, __) in enumerate(rows, start=1):
+        if tg_id == me.tg_id:
+            return idx
+    return None
 
 
 # ---------- Required channels ----------

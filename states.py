@@ -13,7 +13,6 @@ class Reg(StatesGroup):
 
 
 class EditProfile(StatesGroup):
-    name = State()
     photo = State()
     gender = State()
     age = State()

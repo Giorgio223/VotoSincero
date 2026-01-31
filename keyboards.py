@@ -11,7 +11,6 @@ BTN_LEADERBOARD = "🏆 Classifica"
 BTN_BACK = "⬅️ Indietro"
 
 BTN_EDIT_PHOTO = "🖼️ Cambia foto"
-BTN_EDIT_NAME = "🪪 Cambia nome"
 BTN_EDIT_GENDER = "🚻 Cambia genere"
 BTN_EDIT_AGE = "🎂 Cambia età"
 BTN_EDIT_CITY = "📍 Cambia città"
@@ -51,7 +50,6 @@ def main_menu_kb(unread: int = 0) -> ReplyKeyboardMarkup:
 def profile_menu_kb(unread: int = 0) -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
     kb.row(
-        KeyboardButton(text=BTN_EDIT_NAME),
         KeyboardButton(text=BTN_EDIT_PHOTO),
         KeyboardButton(text=BTN_EDIT_GENDER),
         KeyboardButton(text=BTN_EDIT_AGE),
