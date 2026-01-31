@@ -7,6 +7,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, aliased
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
 # ---------- Helpers ----------
@@ -147,6 +149,21 @@ async def init_db(engine):
             # Если он уже был создан раньше — удалим.
             await conn.execute(text("ALTER TABLE ratings DROP CONSTRAINT IF EXISTS uq_rater_rated_version"))
 
+            # В некоторых ранних деплоях мог быть создан другой UNIQUE,
+            # который запрещает повторную оценку, пока предыдущая не просмотрена,
+            # но без учёта версии фото. Это ломает нашу логику (разрешаем оценку
+            # новой версии фото независимо от старой).
+            await conn.execute(text("ALTER TABLE ratings DROP CONSTRAINT IF EXISTS uq_rater_rated_unseen"))
+            await conn.execute(text("DROP INDEX IF EXISTS uq_rater_rated_unseen"))
+
+            # Вместо этого держим уникальность только для 'непросмотренной' оценки
+            # В РАМКАХ ОДНОЙ ВЕРСИИ ФОТО. Это защищает от дабл-кликов/повторов.
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_rater_rated_unseen_idx "
+                "ON ratings (rater_tg_id, rated_tg_id, rated_photo_version) "
+                "WHERE seen = FALSE"
+            ))
+
 
 # ---------- Users ----------
 async def get_user_by_tg_id(session: AsyncSession, tg_id: int) -> User | None:
@@ -220,31 +237,95 @@ async def unblock_user(session: AsyncSession, tg_id: int):
     await session.commit()
 
 
-async def list_all_user_tg_ids(session: AsyncSession, include_blocked: bool = True) -> list[int]:
-    """Return tg_id of every user who has ever started the bot."""
+async def list_all_user_tg_ids(session: AsyncSession, include_blocked: bool = False) -> list[int]:
+    """Return Telegram IDs of all known users.
+
+    NOTE: In this project a "user" is created after registration, so this
+    list corresponds to everyone who has completed registration at least once.
+    """
     q = select(User.tg_id)
     if not include_blocked:
         q = q.where(User.blocked.is_(False))
-    res = await session.execute(q)
+    res = await session.execute(q.order_by(User.id))
     return [int(x) for (x,) in res.all()]
 
 
 # ---------- Ratings ----------
 async def save_rating(session: AsyncSession, rater_tg_id: int, rated_user: User, score: int, message: str | None):
-    r = Rating(
-        rater_tg_id=rater_tg_id,
-        rated_tg_id=rated_user.tg_id,
-        score=score,
-        message=message,
-        rated_photo_version=rated_user.photo_version,
-        seen=False,
-    )
-    session.add(r)
+    """Persist a rating.
+
+    В проде часто встречается двойной клик по кнопке (Telegram повторяет update)
+    или гонка, когда одна и та же оценка пытается записаться дважды.
+
+    Также в старых БД мог оставаться UNIQUE на unseen-оценку без учёта версии фото.
+    Мы его удаляем в init_db, но на всякий случай делаем запись идемпотентной:
+    если unseen-оценка на эту же версию фото уже есть — обновляем её.
+    """
+
+    now = datetime.utcnow()
+
+    # Оптимальный путь для PostgreSQL: UPSERT по нашему парциальному индексу.
+    if session.bind and session.bind.dialect.name == "postgresql":
+        t = Rating.__table__
+        stmt = (
+            pg_insert(t)
+            .values(
+                rater_tg_id=rater_tg_id,
+                rated_tg_id=rated_user.tg_id,
+                score=score,
+                message=message,
+                rated_photo_version=rated_user.photo_version,
+                seen=False,
+                created_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=[t.c.rater_tg_id, t.c.rated_tg_id, t.c.rated_photo_version],
+                index_where=(t.c.seen.is_(False)),
+                set_={
+                    "score": score,
+                    "message": message,
+                    "created_at": now,
+                },
+            )
+            .returning(t.c.id)
+        )
+
+        res = await session.execute(stmt)
+        rid = int(res.scalar_one())
+        r = await session.get(Rating, rid)
+    else:
+        # SQLite / fallback: обычная вставка + обработка ошибки
+        r = Rating(
+            rater_tg_id=rater_tg_id,
+            rated_tg_id=rated_user.tg_id,
+            score=score,
+            message=message,
+            rated_photo_version=rated_user.photo_version,
+            seen=False,
+            created_at=now,
+        )
+        session.add(r)
+        try:
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
+            # Если уже есть unseen запись — обновим её
+            await session.execute(
+                update(Rating)
+                .where(
+                    Rating.rater_tg_id == rater_tg_id,
+                    Rating.rated_tg_id == rated_user.tg_id,
+                    Rating.rated_photo_version == rated_user.photo_version,
+                    Rating.seen.is_(False),
+                )
+                .values(score=score, message=message, created_at=now)
+            )
+
     # отметим активность того, кто ставит оценку
     await session.execute(
         update(User)
         .where(User.tg_id == rater_tg_id)
-        .values(last_active_at=datetime.utcnow())
+        .values(last_active_at=now)
     )
     await session.commit()
     return r
@@ -363,103 +444,83 @@ async def get_next_candidate(session: AsyncSession, viewer: User):
 
 # ---------- Leaderboard ----------
 async def get_top3(session: AsyncSession):
-    """Top 3 with "rating + volume" logic.
+    # We want the leaderboard to account for both the average score and
+    # the number of votes. A high average with only 1 vote should not beat
+    # a slightly lower average with hundreds of votes.
+    #
+    # Use a Bayesian (IMDB-style) weighted rating:
+    #   WR = (v/(v+m))*R + (m/(v+m))*C
+    # where:
+    #   R = user's average, v = user's votes count,
+    #   C = global average, m = минимальный "вес" (smoothing).
+    m = 20  # tune if needed
 
-    We use a Bayesian weighted rating:
-        score = (v/(v+m))*R + (m/(v+m))*C
-    where
-        R = user's average rating (current photo_version only)
-        v = number of ratings
-        C = global average rating (same filtering)
-        m = минимальный порог голосов, чтобы "доверять" среднему (по умолчанию 10)
-
-    This prevents a single 10/10 from outranking someone with many high votes.
-    """
-    m = 10.0
-
-    avg_r = func.avg(Rating.score)
-    cnt_r = func.count(Rating.id)
-
-    base_filter = (
-        (Rating.rated_photo_version == User.photo_version)
-        & User.blocked.is_(False)
-        & profile_complete_filter()
-    )
-
-    global_avg_sq = (
+    overall_avg_subq = (
         select(func.avg(Rating.score))
-        .join(User, User.tg_id == Rating.rated_tg_id)
-        .where(base_filter)
-        .scalar_subquery()
-    )
+        .join(User, Rating.rated_tg_id == User.tg_id)
+        .where(
+            Rating.rated_photo_version == User.photo_version,
+            User.blocked.is_(False),
+            profile_complete_filter(),
+        )
+    ).scalar_subquery()
+
+    avg_score = func.avg(Rating.score)
+    cnt = func.count(Rating.id)
+    weighted = (cnt / (cnt + m)) * avg_score + (m / (cnt + m)) * overall_avg_subq
 
     q = (
-        select(
-            User,
-            avg_r.label("avg_score"),
-            cnt_r.label("cnt"),
-            (
-                (cnt_r / (cnt_r + m)) * avg_r
-                + (m / (cnt_r + m)) * func.coalesce(global_avg_sq, 0)
-            ).label("bayes_score"),
-        )
+        select(User, avg_score.label("avg_score"), cnt.label("cnt"))
         .join(Rating, Rating.rated_tg_id == User.tg_id)
-        .where(base_filter)
+        .where(
+            Rating.rated_photo_version == User.photo_version,
+            User.blocked.is_(False),
+            profile_complete_filter(),
+        )
         .group_by(User.tg_id, User.id)
-        .having(cnt_r > 0)
-        .order_by(text("bayes_score DESC"), cnt_r.desc(), avg_r.desc())
+        .having(cnt > 0)
+        .order_by(weighted.desc(), cnt.desc(), avg_score.desc())
         .limit(3)
     )
     res = await session.execute(q)
-    # keep output shape compatible with old code: (User, avg, cnt)
-    out = []
-    for u, avg, cnt, _bayes in res.all():
-        out.append((u, avg, cnt))
-    return out
-
+    return res.all()
 
 
 async def get_my_rank(session: AsyncSession, me: User):
-    m = 10.0
-    avg_r = func.avg(Rating.score)
-    cnt_r = func.count(Rating.id)
+    m = 20
 
-    base_filter = (
-        (Rating.rated_photo_version == User.photo_version)
-        & User.blocked.is_(False)
-        & profile_complete_filter()
-    )
-
-    global_avg_sq = (
+    overall_avg_subq = (
         select(func.avg(Rating.score))
-        .join(User, User.tg_id == Rating.rated_tg_id)
-        .where(base_filter)
-        .scalar_subquery()
-    )
+        .join(User, Rating.rated_tg_id == User.tg_id)
+        .where(
+            Rating.rated_photo_version == User.photo_version,
+            User.blocked.is_(False),
+            profile_complete_filter(),
+        )
+    ).scalar_subquery()
+
+    avg_score = func.avg(Rating.score)
+    cnt = func.count(Rating.id)
+    weighted = (cnt / (cnt + m)) * avg_score + (m / (cnt + m)) * overall_avg_subq
 
     q = (
-        select(
-            User.tg_id,
-            (
-                (cnt_r / (cnt_r + m)) * avg_r
-                + (m / (cnt_r + m)) * func.coalesce(global_avg_sq, 0)
-            ).label("bayes_score"),
-            cnt_r.label("cnt"),
-            avg_r.label("avg_score"),
-        )
+        select(User.tg_id, avg_score.label("avg_score"), cnt.label("cnt"))
         .join(Rating, Rating.rated_tg_id == User.tg_id)
-        .where(base_filter)
+        .where(
+            Rating.rated_photo_version == User.photo_version,
+            User.blocked.is_(False),
+            profile_complete_filter(),
+        )
         .group_by(User.tg_id)
-        .having(cnt_r > 0)
-        .order_by(text("bayes_score DESC"), cnt_r.desc(), avg_r.desc())
+        .having(cnt > 0)
+        .order_by(weighted.desc(), cnt.desc(), avg_score.desc())
     )
     res = await session.execute(q)
     rows = res.all()
-    for idx, (tg_id, _score, _cnt, _avg) in enumerate(rows, start=1):
-        if int(tg_id) == int(me.tg_id):
+    for idx, (tg_id, _, __) in enumerate(rows, start=1):
+        if tg_id == me.tg_id:
             return idx
     return None
-
 
 
 # ---------- Required channels ----------
