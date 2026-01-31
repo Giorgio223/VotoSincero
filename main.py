@@ -30,7 +30,8 @@ from keyboards import (
     leaderboard_inline_kb, admin_report_kb,
     BTN_MY_PROFILE, BTN_RATE, BTN_WHO_RATED, BTN_LEADERBOARD,
     BTN_BACK,
-    BTN_EDIT_PHOTO, BTN_EDIT_NAME, BTN_EDIT_GENDER, BTN_EDIT_AGE, BTN_EDIT_CITY, BTN_EDIT_BIO,
+    BTN_EDIT_PHOTO, BTN_EDIT_GENDER, BTN_EDIT_AGE, BTN_EDIT_CITY, BTN_EDIT_BIO,
+    BTN_EDIT_NAME,
     BTN_EDIT_BE_RATED_BY, BTN_EDIT_RATE_PREF,
     BTN_SKIP_BIO,
     BTN_GENDER_MALE, BTN_GENDER_FEMALE,
@@ -408,6 +409,31 @@ async def back_to_main(message: Message, state: FSMContext):
 
 
 # ---------- Edit profile ----------
+@dp.message(F.text == BTN_EDIT_NAME)
+async def edit_name_start(message: Message, state: FSMContext):
+    await state.set_state(EditProfile.name)
+    await message.answer(
+        "🪪 Scrivi il nuovo nome oppure il tuo username (esempio: @username)",
+        reply_markup=None
+    )
+
+
+@dp.message(EditProfile.name)
+async def edit_name_save(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not is_valid_name_or_username(name):
+        await message.answer("⚠️ Inserisci un nome valido oppure un username tipo @username.")
+        return
+
+    async with SessionLocal() as session:
+        await update_user_fields(session, message.from_user.id, name=name)
+        user = await get_user_by_tg_id(session, message.from_user.id)
+        unread = await get_unseen_count(session, user) if user else 0
+
+    await state.clear()
+    await message.answer("✅ Nome aggiornato!", reply_markup=profile_menu_kb(unread))
+
+
 @dp.message(F.text == BTN_EDIT_PHOTO)
 async def edit_photo_start(message: Message, state: FSMContext):
     await state.set_state(EditProfile.photo)
@@ -431,36 +457,6 @@ async def edit_photo_save(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer("✅ Foto aggiornata! ⭐ Valutazione azzerata.", reply_markup=profile_menu_kb(unread))
-
-
-@dp.message(F.text == BTN_EDIT_NAME)
-async def edit_name_start(message: Message, state: FSMContext):
-    await state.set_state(EditProfile.name)
-    await message.answer(
-        "🪪 Scrivi il tuo nuovo nome (o @username).\n"
-        "• 2–32 caratteri\n"
-        "• Se inizi con @: solo lettere/numeri/_",
-    )
-
-
-@dp.message(EditProfile.name)
-async def edit_name_save(message: Message, state: FSMContext):
-    name = (message.text or "").strip()
-    if not is_valid_name_or_username(name):
-        await message.answer(
-            "⚠️ Nome non valido.\n"
-            "Esempi: `Mario` oppure `@mario_rossi`",
-            parse_mode="Markdown",
-        )
-        return
-
-    async with SessionLocal() as session:
-        await update_user_fields(session, message.from_user.id, name=name)
-        user = await get_user_by_tg_id(session, message.from_user.id)
-        unread = await get_unseen_count(session, user) if user else 0
-
-    await state.clear()
-    await message.answer("✅ Nome aggiornato!", reply_markup=profile_menu_kb(unread))
 
 @dp.message(F.text == BTN_EDIT_GENDER)
 async def edit_gender_start(message: Message, state: FSMContext):
@@ -872,8 +868,8 @@ async def admin_panel(message: Message):
         "• `/addchannel @channel` (aggiunge)\n"
         "• `/delchannel @channel` (rimuove)\n"
         "• `/listchannels` (lista)\n\n"
-        "📨 Broadcast a tutti gli utenti:\n"
-        "• `/broadcast testo`\n\n"
+        "📨 Broadcast:\n"
+        "• `/broadcast testo...` (invia a tutti gli utenti)\n\n"
         "🚨 Segnalazioni arrivano automaticamente qui con bottoni.",
         parse_mode="Markdown"
     )
@@ -881,46 +877,40 @@ async def admin_panel(message: Message):
 
 @dp.message(Command("broadcast"))
 async def admin_broadcast(message: Message):
-    """Admin command: /broadcast <text>
-
-    Sends a message to all users who have ever registered in the bot.
-    """
     if not is_admin(message.from_user.id):
         return
 
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Uso: `/broadcast testo`", parse_mode="Markdown")
+        await message.answer("Uso: `/broadcast testo...`", parse_mode="Markdown")
         return
 
     text_to_send = parts[1].strip()
 
     async with SessionLocal() as session:
-        user_ids = await list_all_user_tg_ids(session, include_blocked=False)
+        tg_ids = await list_all_user_tg_ids(session)
 
-    if not user_ids:
-        await message.answer("⚠️ Nessun utente in database.")
+    if not tg_ids:
+        await message.answer("📭 Nessun utente nel database.")
         return
 
-    await message.answer(f"📨 Inizio broadcast: {len(user_ids)} utenti")
+    await message.answer(f"📨 Inizio broadcast: {len(tg_ids)} utenti...")
 
     ok = 0
-    failed = 0
-
-    # Telegram rate limits: keep it gentle
-    for i, uid in enumerate(user_ids, start=1):
+    fail = 0
+    # Telegram flood limits: send slowly
+    for i, uid in enumerate(tg_ids, start=1):
         try:
             await bot.send_message(chat_id=uid, text=text_to_send)
             ok += 1
         except Exception:
-            failed += 1
-        # small sleep to avoid hitting limits
+            fail += 1
+
+        # маленькая пауза каждые N сообщений
         if i % 25 == 0:
             await asyncio.sleep(0.8)
-        else:
-            await asyncio.sleep(0.05)
 
-    await message.answer(f"✅ Broadcast finito. Inviati: {ok}, falliti: {failed}")
+    await message.answer(f"✅ Broadcast finito. Inviati: {ok} • Errori: {fail}")
 
 
 @dp.message(Command("unban"))

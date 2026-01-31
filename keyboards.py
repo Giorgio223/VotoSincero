@@ -51,8 +51,8 @@ def main_menu_kb(unread: int = 0) -> ReplyKeyboardMarkup:
 def profile_menu_kb(unread: int = 0) -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
     kb.row(
-        KeyboardButton(text=BTN_EDIT_PHOTO),
         KeyboardButton(text=BTN_EDIT_NAME),
+        KeyboardButton(text=BTN_EDIT_PHOTO),
         KeyboardButton(text=BTN_EDIT_GENDER),
         KeyboardButton(text=BTN_EDIT_AGE),
     )

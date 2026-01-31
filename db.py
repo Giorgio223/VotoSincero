@@ -202,6 +202,15 @@ async def bump_photo_version_and_update_photo(session: AsyncSession, tg_id: int,
     await session.commit()
 
 
+async def list_all_user_tg_ids(session: AsyncSession) -> list[int]:
+    """All users who ever registered (/start -> registration).
+
+    Used for admin broadcast.
+    """
+    res = await session.execute(select(User.tg_id).order_by(User.id.asc()))
+    return [int(x) for (x,) in res.all()]
+
+
 async def block_user(session: AsyncSession, tg_id: int):
     await session.execute(
         update(User)
@@ -218,19 +227,6 @@ async def unblock_user(session: AsyncSession, tg_id: int):
         .values(blocked=False, blocked_at=None)
     )
     await session.commit()
-
-
-async def list_all_user_tg_ids(session: AsyncSession, include_blocked: bool = False) -> list[int]:
-    """Return Telegram IDs of all known users.
-
-    NOTE: In this project a "user" is created after registration, so this
-    list corresponds to everyone who has completed registration at least once.
-    """
-    q = select(User.tg_id)
-    if not include_blocked:
-        q = q.where(User.blocked.is_(False))
-    res = await session.execute(q.order_by(User.id))
-    return [int(x) for (x,) in res.all()]
 
 
 # ---------- Ratings ----------
@@ -367,33 +363,38 @@ async def get_next_candidate(session: AsyncSession, viewer: User):
 
 # ---------- Leaderboard ----------
 async def get_top3(session: AsyncSession):
-    # We want the leaderboard to account for both the average score and
-    # the number of votes. A high average with only 1 vote should not beat
-    # a slightly lower average with hundreds of votes.
-    #
-    # Use a Bayesian (IMDB-style) weighted rating:
-    #   WR = (v/(v+m))*R + (m/(v+m))*C
-    # where:
-    #   R = user's average, v = user's votes count,
-    #   C = global average, m = минимальный "вес" (smoothing).
-    m = 20  # tune if needed
+    """TOP 3 with a score that учитывает и среднюю оценку, и число оценок.
 
-    overall_avg_subq = (
+    We use a Bayesian average:
+      score = (v/(v+m))*R + (m/(v+m))*C
+    where:
+      R = user's avg rating, v = number of ratings,
+      C = global average rating (across current photo versions),
+      m = минимальное "доверие" (the higher, the more we require volume).
+    """
+
+    m = 20  # tuning knob: ~20 votes to be considered "reliable"
+
+    # global average across *current* profiles only (photo_version-aware)
+    global_avg_q = (
         select(func.avg(Rating.score))
-        .join(User, Rating.rated_tg_id == User.tg_id)
+        .select_from(Rating)
+        .join(User, User.tg_id == Rating.rated_tg_id)
         .where(
             Rating.rated_photo_version == User.photo_version,
             User.blocked.is_(False),
             profile_complete_filter(),
         )
-    ).scalar_subquery()
+    )
+    global_avg = float((await session.execute(global_avg_q)).scalar() or 0.0)
 
-    avg_score = func.avg(Rating.score)
     cnt = func.count(Rating.id)
-    weighted = (cnt / (cnt + m)) * avg_score + (m / (cnt + m)) * overall_avg_subq
+    avg = func.avg(Rating.score)
+    # Bayesian score expression
+    score_expr = (cnt / (cnt + m)) * avg + (m / (cnt + m)) * global_avg
 
     q = (
-        select(User, avg_score.label("avg_score"), cnt.label("cnt"))
+        select(User, avg.label("avg_score"), cnt.label("cnt"))
         .join(Rating, Rating.rated_tg_id == User.tg_id)
         .where(
             Rating.rated_photo_version == User.photo_version,
@@ -402,7 +403,7 @@ async def get_top3(session: AsyncSession):
         )
         .group_by(User.tg_id, User.id)
         .having(cnt > 0)
-        .order_by(weighted.desc(), cnt.desc(), avg_score.desc())
+        .order_by(score_expr.desc(), cnt.desc(), avg.desc())
         .limit(3)
     )
     res = await session.execute(q)
@@ -412,22 +413,27 @@ async def get_top3(session: AsyncSession):
 async def get_my_rank(session: AsyncSession, me: User):
     m = 20
 
-    overall_avg_subq = (
+    global_avg_q = (
         select(func.avg(Rating.score))
-        .join(User, Rating.rated_tg_id == User.tg_id)
+        .select_from(Rating)
+        .join(User, User.tg_id == Rating.rated_tg_id)
         .where(
             Rating.rated_photo_version == User.photo_version,
             User.blocked.is_(False),
             profile_complete_filter(),
         )
-    ).scalar_subquery()
+    )
+    global_avg = float((await session.execute(global_avg_q)).scalar() or 0.0)
 
-    avg_score = func.avg(Rating.score)
     cnt = func.count(Rating.id)
-    weighted = (cnt / (cnt + m)) * avg_score + (m / (cnt + m)) * overall_avg_subq
+    avg = func.avg(Rating.score)
+    score_expr = (cnt / (cnt + m)) * avg + (m / (cnt + m)) * global_avg
 
-    q = (
-        select(User.tg_id, avg_score.label("avg_score"), cnt.label("cnt"))
+    ranked = (
+        select(
+            User.tg_id.label("tg_id"),
+            func.row_number().over(order_by=(score_expr.desc(), cnt.desc(), avg.desc())).label("rk"),
+        )
         .join(Rating, Rating.rated_tg_id == User.tg_id)
         .where(
             Rating.rated_photo_version == User.photo_version,
@@ -436,14 +442,12 @@ async def get_my_rank(session: AsyncSession, me: User):
         )
         .group_by(User.tg_id)
         .having(cnt > 0)
-        .order_by(weighted.desc(), cnt.desc(), avg_score.desc())
+        .subquery()
     )
-    res = await session.execute(q)
-    rows = res.all()
-    for idx, (tg_id, _, __) in enumerate(rows, start=1):
-        if tg_id == me.tg_id:
-            return idx
-    return None
+
+    res = await session.execute(select(ranked.c.rk).where(ranked.c.tg_id == me.tg_id))
+    rk = res.scalar_one_or_none()
+    return int(rk) if rk is not None else None
 
 
 # ---------- Required channels ----------
